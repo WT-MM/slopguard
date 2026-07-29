@@ -32,16 +32,73 @@ _DECL_KEYWORDS = {"constructor", "readonly", "static", "final", "get", "set", "n
 def check_generic(path, text, cfg, ext):
     findings = []
     lines = text.splitlines()
+    code = _mask_non_code(text)
+    code_lines = code.splitlines()
     _comments(findings, path, lines, ext)
     if ext in JS_EXTS or ext in {".java", ".cs", ".kt", ".swift", ".scala", ".c", ".cc", ".cpp", ".go"}:
-        _empty_catches(findings, path, text)
+        _empty_catches(findings, path, code)
     if ext in TS_EXTS:
-        _type_escapes(findings, path, lines)
+        _type_escapes(findings, path, code_lines)
     if ext in JS_EXTS:
-        _console_logs(findings, path, lines)
+        _console_logs(findings, path, code_lines)
     if ext in PRIVATE_FIELD_EXTS or ext in JS_EXTS:
         _unused_private_fields(findings, path, text, lines, ext)
     return findings
+
+
+def _mask_non_code(text):
+    """Replace comments and string contents with spaces, preserving offsets."""
+    out = []
+    quote = None
+    block_comment = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        following = text[i:i + 2]
+        if block_comment:
+            if following == "*/":
+                out.extend((" ", " "))
+                block_comment = False
+                i += 2
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+        if quote:
+            if ch == "\\" and i + 1 < len(text):
+                out.append(" ")
+                next_ch = text[i + 1]
+                out.append("\n" if next_ch == "\n" else " ")
+                i += 2
+            elif ch == quote:
+                out.append(" ")
+                quote = None
+                i += 1
+            elif ch == "\n":
+                out.append("\n")
+                if quote != "`":
+                    quote = None
+                i += 1
+            else:
+                out.append(" ")
+                i += 1
+            continue
+        if following == "//":
+            while i < len(text) and text[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif following == "/*":
+            out.extend((" ", " "))
+            block_comment = True
+            i += 2
+        elif ch in "\"'`":
+            out.append(" ")
+            quote = ch
+            i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 def _line_of_offset(text, offset):

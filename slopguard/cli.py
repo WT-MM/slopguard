@@ -1,13 +1,15 @@
 """slopguard CLI: scan paths, run as an agent hook, install hooks."""
 import argparse
+import io
 import json
 import os
 import sys
+import tokenize
 
 from . import __version__
 from .duplicates import find_duplicate_blocks, find_duplicate_functions
 from .findings import at_or_above, counts, sort_findings
-from .generic import JS_EXTS, check_generic
+from .generic import HASH_COMMENT_EXTS, JS_EXTS, _split_comment, check_generic
 from .pychecks import check_python
 from .testchecks import check_generic_tests, check_python_tests
 
@@ -183,16 +185,39 @@ def analyze(texts, cfg, report_files=None):
 def suppress_ignored(findings, texts):
     """Drop findings whose line (or the line above) carries slopguard:ignore."""
     kept = []
-    line_cache = {}
+    ignore_cache = {}
     for f in findings:
-        lines = line_cache.get(f.file)
-        if lines is None:
-            lines = texts.get(f.file, "").splitlines()
-            line_cache[f.file] = lines
-        window = " ".join(lines[max(0, f.line - 2):f.line])
-        if "slopguard:ignore" not in window:
+        ignored = ignore_cache.get(f.file)
+        if ignored is None:
+            ignored = _ignore_lines(f.file, texts.get(f.file, ""))
+            ignore_cache[f.file] = ignored
+        if f.line not in ignored and f.line - 1 not in ignored:
             kept.append(f)
     return kept
+
+
+def _ignore_lines(path, text):
+    if path.lower().endswith(PY_EXT):
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+            return {
+                tok.start[0] for tok in tokens
+                if tok.type == tokenize.COMMENT and "slopguard:ignore" in tok.string
+            }
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            return {
+                lineno for lineno, line in enumerate(text.splitlines(), 1)
+                if "slopguard:ignore" in line
+            }
+
+    ext = os.path.splitext(path)[1].lower()
+    marker = "#" if ext in HASH_COMMENT_EXTS else "//"
+    ignored = set()
+    for lineno, line in enumerate(text.splitlines(), 1):
+        _, comment = _split_comment(line, marker)
+        if comment is not None and "slopguard:ignore" in comment:
+            ignored.add(lineno)
+    return ignored
 
 
 def print_report(findings, out=sys.stdout):

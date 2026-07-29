@@ -9,6 +9,7 @@ from .findings import Finding
 _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 _BLOCK_NODES = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)
 _TERMINATORS = (ast.Return, ast.Raise, ast.Break, ast.Continue)
+_SKIP_DECORATORS = {"skip", "skipif", "xfail"}
 
 
 def check_python(path, text, cfg):
@@ -21,24 +22,25 @@ def check_python(path, text, cfg):
         return []
 
     findings = []
-    parents = _parent_map(tree)
-    _mutable_defaults(findings, path, tree)
-    _placeholder_bodies(findings, path, tree, parents)
-    _dead_code(findings, path, tree)
-    _exception_handling(findings, path, tree)
-    _unused_imports(findings, path, tree)
-    _unused_private(findings, path, tree)
-    _write_only_attrs(findings, path, tree)
-    _size_and_nesting(findings, path, tree, cfg)
-    _single_method_classes(findings, path, tree)
-    _debug_prints(findings, path, tree)
+    nodes = list(ast.walk(tree))
+    parents = _parent_map(nodes)
+    _mutable_defaults(findings, path, nodes)
+    _placeholder_bodies(findings, path, nodes, parents)
+    _dead_code(findings, path, nodes)
+    _exception_handling(findings, path, nodes)
+    _unused_imports(findings, path, tree, nodes)
+    _unused_private(findings, path, tree, nodes)
+    _write_only_attrs(findings, path, nodes)
+    _size_and_nesting(findings, path, nodes, cfg)
+    _single_method_classes(findings, path, nodes)
+    _debug_prints(findings, path, nodes)
     _comments(findings, path, text)
     return findings
 
 
-def _parent_map(tree):
+def _parent_map(nodes):
     parents = {}
-    for node in ast.walk(tree):
+    for node in nodes:
         for child in ast.iter_child_nodes(node):
             parents[child] = node
     return parents
@@ -68,8 +70,8 @@ def _decorator_names(fn):
     return names
 
 
-def _mutable_defaults(findings, path, tree):
-    for fn in (n for n in ast.walk(tree) if isinstance(n, _FUNC_NODES)):
+def _mutable_defaults(findings, path, nodes):
+    for fn in (n for n in nodes if isinstance(n, _FUNC_NODES)):
         for default in list(fn.args.defaults) + [d for d in fn.args.kw_defaults if d]:
             bad = isinstance(default, (ast.List, ast.Dict, ast.Set)) or (
                 isinstance(default, ast.Call) and isinstance(default.func, ast.Name)
@@ -80,10 +82,11 @@ def _mutable_defaults(findings, path, tree):
                     "mutable default argument in %s(); shared across calls — use None" % fn.name))
 
 
-def _placeholder_bodies(findings, path, tree, parents):
-    for fn in (n for n in ast.walk(tree) if isinstance(n, _FUNC_NODES)):
+def _placeholder_bodies(findings, path, nodes, parents):
+    for fn in (n for n in nodes if isinstance(n, _FUNC_NODES)):
         decs = _decorator_names(fn)
-        if any("abstract" in d or d == "overload" for d in decs):
+        if any("abstract" in d or d == "overload" or d in _SKIP_DECORATORS
+               for d in decs):
             continue
         parent = parents.get(fn)
         if isinstance(parent, ast.ClassDef):
@@ -113,8 +116,8 @@ def _placeholder_bodies(findings, path, tree, parents):
                 "%s() has no implementation (pass/... only) — implement it or delete it" % fn.name))
 
 
-def _dead_code(findings, path, tree):
-    for node in ast.walk(tree):
+def _dead_code(findings, path, nodes):
+    for node in nodes:
         for field in ("body", "orelse", "finalbody"):
             stmts = getattr(node, field, None)
             if not isinstance(stmts, list):
@@ -130,8 +133,8 @@ def _dead_code(findings, path, tree):
                     terminated_at = (type(s).__name__.lower(), s.lineno)
 
 
-def _exception_handling(findings, path, tree):
-    for node in ast.walk(tree):
+def _exception_handling(findings, path, nodes):
+    for node in nodes:
         if not isinstance(node, ast.ExceptHandler):
             continue
         if node.type is None:
@@ -145,27 +148,29 @@ def _exception_handling(findings, path, tree):
                 "exception silently swallowed (`except: pass`) — handle, log, or re-raise"))
 
 
-def _top_level_imports(tree):
+def _top_level_imports(nodes):
     """(local_name, lineno) pairs; indented imports are often conditional/optional — skip."""
     imported = []
-    for node in ast.walk(tree):
+    for node in nodes:
         if getattr(node, "col_offset", 0) != 0:
             continue
         if isinstance(node, ast.Import):
-            imported.extend((a.asname or a.name.split(".")[0], node.lineno) for a in node.names)
+            imported.extend(
+                (a.asname or a.name.split(".")[0], node.lineno)
+                for a in node.names if a.asname or "." not in a.name)
         elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
             imported.extend((a.asname or a.name, node.lineno)
                             for a in node.names if a.name != "*")
     return imported
 
 
-def _unused_imports(findings, path, tree):
+def _unused_imports(findings, path, tree, nodes):
     if path.endswith("__init__.py"):
         return
-    imported = _top_level_imports(tree)
+    imported = _top_level_imports(nodes)
     if not imported:
         return
-    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    used = {n.id for n in nodes if isinstance(n, ast.Name)}
     exported = set()
     for node in tree.body:
         if isinstance(node, ast.Assign):
@@ -181,10 +186,10 @@ def _unused_imports(findings, path, tree):
                 "`%s` is imported but never used" % name))
 
 
-def _unused_private(findings, path, tree):
-    loads = {n.id for n in ast.walk(tree)
+def _unused_private(findings, path, tree, nodes):
+    loads = {n.id for n in nodes
              if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-    attr_refs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    attr_refs = {n.attr for n in nodes if isinstance(n, ast.Attribute)}
 
     for node in tree.body:
         if isinstance(node, _FUNC_NODES + (ast.ClassDef,)):
@@ -195,7 +200,7 @@ def _unused_private(findings, path, tree):
                     "private %s `%s` is never used in this file" %
                     ("class" if isinstance(node, ast.ClassDef) else "function", name)))
 
-    for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+    for cls in (n for n in nodes if isinstance(n, ast.ClassDef)):
         for m in cls.body:
             if not isinstance(m, _FUNC_NODES):
                 continue
@@ -211,10 +216,10 @@ def _unused_private(findings, path, tree):
                     "(if it's a framework hook, add a slopguard:ignore comment)" % (cls.name, name)))
 
 
-def _write_only_attrs(findings, path, tree):
+def _write_only_attrs(findings, path, nodes):
     stores = {}  # attr -> first store lineno
     reads = set()
-    for node in ast.walk(tree):
+    for node in nodes:
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
             if isinstance(node.ctx, ast.Store):
                 stores.setdefault(node.attr, node.lineno)
@@ -230,10 +235,10 @@ def _write_only_attrs(findings, path, tree):
                 "`self.%s` is assigned but never read in this file — state added \"just in case\"?" % attr))
 
 
-def _size_and_nesting(findings, path, tree, cfg):
+def _size_and_nesting(findings, path, nodes, cfg):
     max_lines = cfg.get("max_function_lines", 80)
     max_depth = cfg.get("max_nesting", 4)
-    for fn in (n for n in ast.walk(tree) if isinstance(n, _FUNC_NODES)):
+    for fn in (n for n in nodes if isinstance(n, _FUNC_NODES)):
         end = getattr(fn, "end_lineno", fn.lineno)
         span = end - fn.lineno + 1
         if span > max_lines:
@@ -261,8 +266,8 @@ def _size_and_nesting(findings, path, tree, cfg):
                 % (fn.name, worst[0], max_depth)))
 
 
-def _single_method_classes(findings, path, tree):
-    for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+def _single_method_classes(findings, path, nodes):
+    for cls in (n for n in nodes if isinstance(n, ast.ClassDef)):
         if cls.bases or cls.keywords or cls.decorator_list:
             continue
         methods, other = [], []
@@ -281,11 +286,11 @@ def _single_method_classes(findings, path, tree):
                 "class %s has one real method (%s) — a function may be simpler" % (cls.name, public[0].name)))
 
 
-def _debug_prints(findings, path, tree):
+def _debug_prints(findings, path, nodes):
     # print() is only suspicious when the module already has a logger —
     # in plain scripts/CLIs, print IS the output mechanism.
     logs = False
-    for node in ast.walk(tree):
+    for node in nodes:
         if isinstance(node, ast.Import):
             logs = logs or any(a.name.split(".")[0] in ("logging", "loguru", "structlog")
                                for a in node.names)
@@ -293,7 +298,7 @@ def _debug_prints(findings, path, tree):
             logs = logs or (node.module or "").split(".")[0] in ("logging", "loguru", "structlog")
     if not logs:
         return
-    for node in ast.walk(tree):
+    for node in nodes:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print":
             findings.append(Finding(
                 "debug-artifact", "info", path, node.lineno,

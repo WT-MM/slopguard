@@ -7,7 +7,7 @@ on files `cli.is_test_file` classifies as tests.
 import ast
 import re
 
-from .duplicates import _Renamer
+from .duplicates import _argument_names
 from .findings import Finding
 
 # Calls to helpers with these fragments in their name count as assertions,
@@ -24,6 +24,7 @@ MAX_MOCKS_PER_TEST = 5
 LONG_STRING_ASSERT = 48
 BIG_LITERAL_ENTRIES = 8
 MIN_PARAMETRIZE_GROUP = 3
+_SLEEP_MODULES = {"asyncio", "time", "trio", "anyio", "gevent", "eventlet"}
 
 
 def check_python_tests(path, text, cfg):
@@ -33,8 +34,10 @@ def check_python_tests(path, text, cfg):
         return []
     findings = []
     tests = _collect_test_functions(tree)
+    sleep_modules, sleep_functions = _sleep_symbols(tree)
     for fn in tests:
-        _check_one_test(findings, path, fn, cfg)
+        _check_one_test(
+            findings, path, fn, cfg, sleep_modules, sleep_functions)
     _parametrize_candidates(findings, path, tests, cfg)
     return findings
 
@@ -85,7 +88,7 @@ def _is_placeholder(fn):
                for s in body)
 
 
-def _check_one_test(findings, path, fn, cfg):
+def _check_one_test(findings, path, fn, cfg, sleep_modules, sleep_functions):
     assertions = _classify_assertions(fn)
 
     if not assertions and not _is_placeholder(fn):
@@ -102,7 +105,7 @@ def _check_one_test(findings, path, fn, cfg):
     _conditional_asserts(findings, path, fn)
     _overspecified_asserts(findings, path, fn)
     _mock_echo(findings, path, fn)
-    _sleeps(findings, path, fn)
+    _sleeps(findings, path, fn, sleep_modules, sleep_functions)
     _private_pokes(findings, path, fn)
     _mock_count(findings, path, fn)
 
@@ -221,13 +224,43 @@ def _mock_echo(findings, path, fn):
                 return
 
 
-def _sleeps(findings, path, fn):
+def _sleep_symbols(tree):
+    modules = set()
+    functions = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _SLEEP_MODULES:
+                    modules.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module in _SLEEP_MODULES:
+            for alias in node.names:
+                if alias.name == "sleep":
+                    functions.add(alias.asname or alias.name)
+    return modules, functions
+
+
+def _locally_bound_names(fn):
+    names = _argument_names(fn.args)
+    names.update(
+        node.id for node in ast.walk(fn)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
+    return names
+
+
+def _sleeps(findings, path, fn, sleep_modules, sleep_functions):
+    shadowed = _locally_bound_names(fn)
     for node in ast.walk(fn):
         if not isinstance(node, ast.Call):
             continue
         f = node.func
-        is_sleep = (isinstance(f, ast.Attribute) and f.attr == "sleep") or \
-                   (isinstance(f, ast.Name) and f.id == "sleep")
+        is_sleep = (
+            isinstance(f, ast.Attribute) and f.attr == "sleep"
+            and isinstance(f.value, ast.Name)
+            and f.value.id in sleep_modules and f.value.id not in shadowed
+        ) or (
+            isinstance(f, ast.Name) and f.id in sleep_functions
+            and f.id not in shadowed
+        )
         if not is_sleep:
             continue
         if node.args and isinstance(node.args[0], ast.Constant) and not node.args[0].value:
@@ -281,7 +314,7 @@ def _mock_count(findings, path, fn):
             "test a bigger unit or restructure the dependency" % (fn.name, count)))
 
 
-class _ConstNorm(_Renamer):
+class _ConstNorm(ast.NodeTransformer):
     def visit_Constant(self, node):
         return ast.copy_location(ast.Constant(value="C"), node)
 
@@ -293,6 +326,8 @@ def _test_shape(fn):
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
             and isinstance(body[0].value.value, str):
         fn.body = body[1:]
+    fn.name = "test"
+    fn.decorator_list = []
     fn = _ConstNorm().visit(fn)
     return ast.dump(fn, annotate_fields=False)
 

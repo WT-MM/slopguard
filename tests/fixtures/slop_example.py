@@ -1,4 +1,5 @@
 """Fixture: deliberately slop-ridden Python for slopguard's tests."""
+import integrations.payment_gateway
 import json
 import os  # unused-import: never referenced
 

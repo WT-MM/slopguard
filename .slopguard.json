@@ -1,0 +1,5 @@
+{
+  "hook_exclude": [
+    "*/tests/fixtures/*"
+  ]
+}

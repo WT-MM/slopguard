@@ -89,7 +89,9 @@ slopguard error never blocks the agent. Typical hook latency: <100 ms.
 
 - `slopguard:ignore` in a comment on (or directly above) the flagged line.
 - `.slopguard.json` at repo root:
-  `{"disable": ["long-function"], "max_function_lines": 120, "max_nesting": 5, "fail_on": "error"}`
+  `{"disable": ["long-function"], "max_function_lines": 120, "max_nesting": 5, "fail_on": "error", "hook_exclude": ["*/tests/fixtures/*"]}`.
+  `hook_exclude` uses `fnmatch` patterns against absolute paths and affects
+  hook targets only; explicit `scan` paths are never excluded.
 - `SLOPGUARD_DISABLE=1` env var kills the hook entirely;
   `SLOPGUARD_DISABLE_RULES=rule,rule` disables specific rules.
 

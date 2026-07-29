@@ -6,12 +6,12 @@ text on stderr feeds the findings back to the model as blocking feedback.
 Designed to fail OPEN: any internal error exits 0/1 (non-blocking) so a bug
 here never bricks the agent's editing loop.
 """
-import contextlib
 import hashlib
 import json
 import os
 import subprocess
 import sys
+from fnmatch import fnmatch
 
 from .cli import analyze, is_checkable, load_config, read_texts
 from .findings import at_or_above, sort_findings
@@ -19,7 +19,8 @@ from .findings import at_or_above, sort_findings
 MAX_TARGET_FILES = 40
 MAX_CONTEXT_FILES = 30
 MAX_REPORT_LINES = 30
-STATE_DIR = os.path.expanduser("~/.cache/slopguard")
+STATE_DIR = os.environ.get(
+    "SLOPGUARD_STATE_DIR", os.path.expanduser("~/.cache/slopguard"))
 
 
 def run_hook(args):
@@ -48,11 +49,11 @@ def _run(args):
     targets = _files_from_tool_input(event.get("tool_input"), cwd)
     if not targets and (event_name.startswith("Stop") or not event_name):
         targets = _git_changed_files(cwd)
-    targets = [t for t in targets if "/fixtures/" not in t][:MAX_TARGET_FILES]
+    cfg = load_config(cwd)
+    targets = _filter_excluded(targets, cfg)[:MAX_TARGET_FILES]
     if not targets:
         return 0
 
-    cfg = load_config(cwd)
     texts = read_texts(targets + _context_files(targets))
     findings = analyze(texts, cfg, report_files=set(targets))
     blocking = at_or_above(findings, "warn")
@@ -78,17 +79,29 @@ def _files_from_tool_input(tool_input, cwd):
     """Pull real file paths out of whatever shape the agent's tool input has."""
     found = []
 
+    def add_path(value):
+        value = value.strip()
+        if not value or len(value) > 500:
+            return False
+        candidate = value if os.path.isabs(value) else os.path.join(cwd, value)
+        if os.path.isfile(candidate) and is_checkable(candidate):
+            found.append(os.path.abspath(candidate))
+            return True
+        return False
+
     def visit(value):
         if isinstance(value, str):
+            if add_path(value):
+                return
             for token in value.splitlines()[:200]:
                 token = token.strip().lstrip("+-*").strip()
-                if token.startswith("Update File:") or token.startswith("Add File:"):
+                is_patch_path = token.startswith(
+                    ("Update File:", "Add File:", "Move to:"))
+                if is_patch_path:
                     token = token.split(":", 1)[1].strip()  # Codex apply_patch headers
-                if not token or len(token) > 500 or " " in token:
+                if " " in token and not is_patch_path:
                     continue
-                candidate = token if os.path.isabs(token) else os.path.join(cwd, token)
-                if os.path.isfile(candidate) and is_checkable(candidate):
-                    found.append(os.path.abspath(candidate))
+                add_path(token)
         elif isinstance(value, dict):
             for v in value.values():
                 visit(v)
@@ -105,18 +118,61 @@ def _files_from_tool_input(tool_input, cwd):
     return unique
 
 
+def _filter_excluded(targets, cfg):
+    patterns = cfg.get("hook_exclude", [])
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    if not isinstance(patterns, (list, tuple)):
+        return targets
+    return [
+        path for path in targets
+        if not any(fnmatch(os.path.abspath(path), pattern) for pattern in patterns)
+    ]
+
+
 def _git_changed_files(cwd):
-    files = []
-    for cmd in (["git", "diff", "--name-only", "HEAD"],
-                ["git", "ls-files", "--others", "--exclude-standard"]):
+    try:
+        root_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=cwd,
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if root_result.returncode != 0:
+        return []
+    root = root_result.stdout.strip()
+    if not root:
+        return []
+
+    def git_output(cmd):
         try:
-            out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=10)
+            return subprocess.run(
+                cmd, cwd=root, capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    diff = git_output(["git", "diff", "--name-only", "HEAD"])
+    if diff is None:
+        return []
+    if diff.returncode == 0:
+        results = [diff]
+    else:
+        # An unborn repository has no HEAD. Its staged files are not
+        # "untracked", so compare both the index and working tree directly.
+        results = [
+            git_output(["git", "diff", "--name-only", "--cached"]),
+            git_output(["git", "diff", "--name-only"]),
+        ]
+    results.append(git_output(
+        ["git", "ls-files", "--others", "--exclude-standard"]))
+
+    files = []
+    for out in results:
+        if out is None:
             return []
         if out.returncode != 0:
             continue
         for rel in out.stdout.splitlines():
-            path = os.path.join(cwd, rel.strip())
+            path = os.path.join(root, rel.strip())
             if os.path.isfile(path) and is_checkable(path):
                 files.append(os.path.abspath(path))
     return files
@@ -149,15 +205,21 @@ def _already_reported(event, blocking):
     session = str(event.get("session_id", "nosession"))
     digest = hashlib.sha1(
         "\n".join(sorted(f.format() for f in blocking)).encode()).hexdigest()
-    os.makedirs(STATE_DIR, exist_ok=True)
-    state_file = os.path.join(STATE_DIR, "stop-%s" % hashlib.sha1(session.encode()).hexdigest()[:16])
-    previous = None
-    with contextlib.suppress(OSError):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        state_file = os.path.join(
+            STATE_DIR, "stop-%s" % hashlib.sha1(session.encode()).hexdigest()[:16])
         with open(state_file) as fh:
             previous = fh.read().strip()
+    except FileNotFoundError:
+        previous = None
+    except OSError:
+        return True  # cannot guarantee a loop guard, so fail open
     if previous == digest:
         return True
-    with contextlib.suppress(OSError):
+    try:
         with open(state_file, "w") as fh:
             fh.write(digest)
+    except OSError:
+        return True
     return False

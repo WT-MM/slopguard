@@ -7,7 +7,6 @@ Two passes:
    catches "wrote the same helper again with different names".
 """
 import ast
-import copy
 
 from .findings import Finding
 
@@ -73,9 +72,56 @@ def find_duplicate_blocks(files):
     return findings
 
 
+def _argument_names(args):
+    names = {
+        arg.arg for arg in (
+            list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs))
+    }
+    if args.vararg:
+        names.add(args.vararg.arg)
+    if args.kwarg:
+        names.add(args.kwarg.arg)
+    return names
+
+
+def _bound_names(fn):
+    names = _argument_names(fn.args)
+    global_names = set()
+    nonlocal_names = set()
+
+    def visit(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(child.name)
+                continue
+            if isinstance(child, ast.Lambda):
+                continue
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                names.add(child.id)
+            elif isinstance(child, ast.Import):
+                names.update(a.asname or a.name.split(".")[0] for a in child.names)
+            elif isinstance(child, ast.ImportFrom):
+                names.update(a.asname or a.name for a in child.names if a.name != "*")
+            elif isinstance(child, ast.ExceptHandler) and child.name:
+                names.add(child.name)
+            elif isinstance(child, ast.Global):
+                global_names.update(child.names)
+            elif isinstance(child, ast.Nonlocal):
+                nonlocal_names.update(child.names)
+            visit(child)
+
+    visit(fn)
+    names.difference_update(global_names | nonlocal_names)
+    return names
+
+
 class _Renamer(ast.NodeTransformer):
+    def __init__(self):
+        self.scopes = []
+
     def visit_Name(self, node):
-        node.id = "x"
+        if self.scopes and node.id in self.scopes[-1]:
+            node.id = "x"
         return self.generic_visit(node)
 
     def visit_arg(self, node):
@@ -84,16 +130,24 @@ class _Renamer(ast.NodeTransformer):
         return node
 
     def visit_FunctionDef(self, node):
+        self.scopes.append(_bound_names(node))
         node.name = "x"
         node.returns = None
         node.decorator_list = []
-        return self.generic_visit(node)
+        node = self.generic_visit(node)
+        self.scopes.pop()
+        return node
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
+    def visit_Lambda(self, node):
+        self.scopes.append(_bound_names(node))
+        node = self.generic_visit(node)
+        self.scopes.pop()
+        return node
+
 
 def _shape(fn):
-    fn = copy.deepcopy(fn)
     body = fn.body
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
             and isinstance(body[0].value.value, str):
@@ -110,14 +164,18 @@ def find_duplicate_functions(py_files):
             tree = ast.parse(text)
         except (SyntaxError, ValueError, RecursionError):
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if node.name.startswith("__") and node.name.endswith("__"):
+        functions = [
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        names = {id(node): node.name for node in functions}
+        for node in functions:
+            name = names[id(node)]
+            if name.startswith("__") and name.endswith("__"):
                 continue  # dunders (esp. __init__) are boilerplate-shaped by nature
             n_stmts = sum(1 for d in ast.walk(node) if isinstance(d, ast.stmt))
             if n_stmts >= 5:  # includes the def itself; skip trivial bodies
-                index.setdefault(_shape(node), []).append((path, node.lineno, node.name))
+                index.setdefault(_shape(node), []).append((path, node.lineno, name))
 
     findings = []
     for locs in index.values():
