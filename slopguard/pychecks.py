@@ -133,6 +133,24 @@ def _dead_code(findings, path, nodes):
                     terminated_at = (type(s).__name__.lower(), s.lineno)
 
 
+# Cancellation is a control-flow signal, not an error: `except CancelledError:
+# pass` after task.cancel() is the canonical asyncio/trio/anyio shutdown idiom.
+_CANCELLATION_NAMES = {"CancelledError", "Cancelled"}
+
+
+def _caught_names(handler):
+    types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    names = []
+    for t in types:
+        if isinstance(t, ast.Attribute):
+            names.append(t.attr)
+        elif isinstance(t, ast.Name):
+            names.append(t.id)
+        else:
+            names.append("")
+    return names
+
+
 def _exception_handling(findings, path, nodes):
     for node in nodes:
         if not isinstance(node, ast.ExceptHandler):
@@ -141,11 +159,15 @@ def _exception_handling(findings, path, nodes):
             findings.append(Finding(
                 "bare-except", "warn", path, node.lineno,
                 "bare `except:` catches SystemExit/KeyboardInterrupt too — name the exception"))
-        body_is_noop = all(isinstance(s, ast.Pass) for s in node.body)
-        if body_is_noop:
-            findings.append(Finding(
-                "swallowed-exception", "warn", path, node.lineno,
-                "exception silently swallowed (`except: pass`) — handle, log, or re-raise"))
+        if not all(isinstance(s, ast.Pass) for s in node.body):
+            continue
+        if node.type is not None and \
+                all(n in _CANCELLATION_NAMES for n in _caught_names(node)):
+            continue
+        findings.append(Finding(
+            "swallowed-exception", "warn", path, node.lineno,
+            "exception silently swallowed (`except: pass`) — handle, log, re-raise, "
+            "or make suppression explicit with contextlib.suppress"))
 
 
 def _top_level_imports(nodes):

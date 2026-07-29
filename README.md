@@ -127,6 +127,10 @@ slopguard error never blocks the agent. Typical hook latency: <100 ms.
 ## Escape hatches
 
 - `slopguard:ignore` in a comment on (or directly above) the flagged line.
+  Name rules to scope it — `# slopguard:ignore swallowed-exception — expected
+  on our own cancel()` suppresses only that rule; a bare ignore suppresses
+  everything on the line. Reasons after a dash are encouraged and never
+  parsed as rule names.
 - `.slopguard.json` at repo root:
   `{"disable": ["long-function"], "max_function_lines": 120, "max_nesting": 5, "fail_on": "error", "hook_exclude": ["*/tests/fixtures/*"]}`.
   `hook_exclude` uses `fnmatch` patterns against absolute paths and affects

@@ -288,40 +288,64 @@ def analyze(texts, cfg, report_files=None, schema_texts=None):
 
 
 def suppress_ignored(findings, texts):
-    """Drop findings whose line (or the line above) carries slopguard:ignore."""
+    """Drop findings suppressed by a slopguard:ignore comment on (or directly
+    above) their line. `slopguard:ignore rule-name` suppresses only that rule;
+    a bare `slopguard:ignore` suppresses everything on the line."""
     kept = []
     ignore_cache = {}
     for f in findings:
-        ignored = ignore_cache.get(f.file)
-        if ignored is None:
-            ignored = _ignore_lines(f.file, texts.get(f.file, ""))
-            ignore_cache[f.file] = ignored
-        if f.line not in ignored and f.line - 1 not in ignored:
+        if f.file not in ignore_cache:
+            ignore_cache[f.file] = _ignore_lines(f.file, texts.get(f.file, ""))
+        if not _is_suppressed(f, ignore_cache[f.file]):
             kept.append(f)
     return kept
 
 
+def _is_suppressed(finding, ignored):
+    for lineno in (finding.line, finding.line - 1):
+        scope = ignored.get(lineno, False)
+        if scope is False:
+            continue
+        if scope is None or finding.rule in scope:
+            return True
+    return False
+
+
+def _ignore_scope(comment):
+    """None = suppress all rules; a set = suppress only those named.
+
+    Rule names must appear between `slopguard:ignore` and any dash-separated
+    reason ("slopguard:ignore swallowed-exception — expected on cancel")."""
+    _, _, rest = comment.partition("slopguard:ignore")
+    rest = re.split(r"—|--|\(", rest, maxsplit=1)[0]
+    named = {tok for tok in re.findall(r"[a-z][a-z-]*[a-z]", rest) if tok in RULES}
+    return named or None
+
+
 def _ignore_lines(path, text):
+    """{lineno: scope} for slopguard:ignore comments (see _ignore_scope)."""
     if path.lower().endswith(PY_EXT):
         try:
             tokens = tokenize.generate_tokens(io.StringIO(text).readline)
             return {
-                tok.start[0] for tok in tokens
+                tok.start[0]: _ignore_scope(tok.string)
+                for tok in tokens
                 if tok.type == tokenize.COMMENT and "slopguard:ignore" in tok.string
             }
         except (tokenize.TokenError, IndentationError, SyntaxError):
             return {
-                lineno for lineno, line in enumerate(text.splitlines(), 1)
+                lineno: _ignore_scope(line)
+                for lineno, line in enumerate(text.splitlines(), 1)
                 if "slopguard:ignore" in line
             }
 
     ext = os.path.splitext(path)[1].lower()
     marker = "#" if ext in HASH_COMMENT_EXTS else "//"
-    ignored = set()
+    ignored = {}
     for lineno, line in enumerate(text.splitlines(), 1):
         _, comment = _split_comment(line, marker)
         if comment is not None and "slopguard:ignore" in comment:
-            ignored.add(lineno)
+            ignored[lineno] = _ignore_scope(comment)
     return ignored
 
 

@@ -151,6 +151,29 @@ def test_suppression():
         r = run(["scan", path, "--json"])
         check("slopguard:ignore suppresses", r.returncode == 0 and json.loads(r.stdout) == [])
 
+        scoped = os.path.join(td, "scoped.py")
+        with open(scoped, "w") as fh:
+            fh.write('''\
+def right(x=[]):  # slopguard:ignore mutable-default — shared cache is the point
+    return x
+
+
+def wrong(y=[]):  # slopguard:ignore dead-code — names a rule that is not firing here
+    return y
+
+
+def reasoned(z=[]):  # slopguard:ignore — reason text only, suppresses everything
+    return z
+''')
+        r = run(["scan", scoped, "--json", "--fail-on", "never"])
+        left = {(f["rule"], f["line"]) for f in json.loads(r.stdout)}
+        check("named-rule ignore suppresses that rule", ("mutable-default", 1) not in left,
+              str(left))
+        check("named-rule ignore does NOT suppress other rules", ("mutable-default", 5) in left,
+              str(left))
+        check("bare ignore with dash-reason still suppresses all",
+              ("mutable-default", 9) not in left, str(left))
+
         string_path = os.path.join(td, "string_marker.py")
         with open(string_path, "w") as fh:
             fh.write('marker = "slopguard:ignore"\nimport os\n')
