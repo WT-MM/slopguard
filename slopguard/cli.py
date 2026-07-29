@@ -1,12 +1,15 @@
 """slopguard CLI: scan paths, run as an agent hook, install hooks."""
 import argparse
+import glob as globlib
 import io
 import json
 import os
+import re
 import sys
 import tokenize
 
 from . import __version__
+from .contracts import check_contracts, schema_messages
 from .duplicates import find_duplicate_blocks, find_duplicate_functions
 from .findings import at_or_above, counts, sort_findings
 from .generic import HASH_COMMENT_EXTS, JS_EXTS, _split_comment, check_generic
@@ -25,10 +28,18 @@ IGNORED_DIR_PARTS = {
     ".cache", "coverage",
 }
 GENERATED_SUFFIXES = (".min.js", ".min.css", "_pb2.py", "_pb2_grpc.py", ".d.ts")
+SCHEMA_EXTS = {
+    ".proto", ".textproto", ".avsc", ".thrift", ".graphql", ".graphqls", ".gql",
+}
+# JSON/YAML are schemas only when named like one; anything else is data.
+_SCHEMA_NAMED = re.compile(r"schema|openapi|swagger|asyncapi", re.I)
+_SCHEMA_DATA_EXTS = {".json", ".yaml", ".yml"}
+MAX_SCHEMA_FILES = 200
 MAX_FILE_BYTES = 512 * 1024
 MAX_SCAN_FILES = 4000
 TEST_RELAXED_RULES = {"as-any", "ts-ignore", "duplicate-code", "debug-artifact",
-                      "long-function", "deep-nesting"}
+                      "long-function", "deep-nesting",
+                      "hand-rolled-contract", "contract-drift-key"}
 _TEST_PATH_PARTS = ("/tests/", "/test/", "/__tests__/", "/spec/")
 
 
@@ -57,6 +68,9 @@ RULES = {
     "deep-nesting":       "warn   py       nesting deeper than max_nesting (default 4)",
     "as-any":             "warn   ts       `as any` cast",
     "ts-ignore":          "warn   ts       @ts-ignore / @ts-nocheck",
+    "contract-drift-key": "warn   py       camelCase key with no schema field, in a dict that speaks the schema",
+    "hand-rolled-contract":"warn  py       dict literal hand-builds a schema-defined message",
+    "contract-case-skew": "info   py       in-sync hand-mapping of a schema field (parentFrame for parent_frame)",
     "no-assert-test":     "warn   tests    test never asserts — only proves the code doesn't crash",
     "mock-only-test":     "warn   tests    every assertion is a mock-call assertion — tests wiring, not behavior",
     "mock-echo-test":     "warn   tests    asserts the exact value the mock was told to return",
@@ -85,6 +99,9 @@ def load_config(start_dir):
                     cfg = json.load(fh)
             except (OSError, ValueError):
                 cfg = {}
+            if not isinstance(cfg, dict):
+                cfg = {}
+            cfg["_config_dir"] = d
             break
         parent = os.path.dirname(d)
         if parent == d:
@@ -135,6 +152,45 @@ def collect_files(paths):
     return files
 
 
+def is_schema_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in SCHEMA_EXTS:
+        return True
+    return ext in _SCHEMA_DATA_EXTS and bool(_SCHEMA_NAMED.search(os.path.basename(path)))
+
+
+def _walk_schemas(directory, dir_budget):
+    for root, dirs, names in os.walk(directory):
+        if dir_budget is not None:
+            if not dir_budget[0]:
+                return
+            dir_budget[0] -= 1
+        dirs[:] = sorted(
+            d for d in dirs
+            if d not in IGNORED_DIR_PARTS and not d.startswith("."))
+        for name in sorted(names):
+            if is_schema_file(name):
+                yield os.path.join(root, name)
+
+
+def collect_schema_files(paths, max_files=MAX_SCHEMA_FILES, max_dirs=None):
+    """Message-schema files under the given paths (see is_schema_file)."""
+    schemas = []
+    dir_budget = [max_dirs] if max_dirs is not None else None
+    for p in paths:
+        p = os.path.abspath(p)
+        if os.path.isfile(p) and is_schema_file(p):
+            schemas.append(p)
+        elif os.path.isdir(p):
+            for schema in _walk_schemas(p, dir_budget):
+                schemas.append(schema)
+                if len(schemas) >= max_files:
+                    return schemas
+        if len(schemas) >= max_files:
+            return schemas
+    return schemas
+
+
 def read_texts(files):
     texts = {}
     for f in files:
@@ -146,10 +202,57 @@ def read_texts(files):
     return texts
 
 
-def analyze(texts, cfg, report_files=None):
+def config_schema_files(cfg, max_files=MAX_SCHEMA_FILES, max_dirs=None):
+    """Schema files named by config: contract_schemas globs + schema_roots dirs,
+    resolved relative to the directory holding .slopguard.json."""
+    if max_files <= 0:
+        return []
+    base = cfg.get("_config_dir") or "."
+    files = []
+    seen = set()
+
+    def add(path):
+        path = os.path.abspath(path)
+        if path not in seen and os.path.isfile(path):
+            seen.add(path)
+            files.append(path)
+
+    patterns = cfg.get("contract_schemas", [])
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    for pattern in patterns if isinstance(patterns, (list, tuple)) else []:
+        if not isinstance(pattern, str):
+            continue
+        resolved = pattern if os.path.isabs(pattern) else os.path.join(base, pattern)
+        for match in globlib.iglob(resolved, recursive=True):
+            add(match)
+            if len(files) >= max_files:
+                return files
+    roots = cfg.get("schema_roots", [])
+    if isinstance(roots, str):
+        roots = [roots]
+    if isinstance(roots, (list, tuple)):
+        dirs = [
+            r if os.path.isabs(r) else os.path.join(base, r)
+            for r in roots if isinstance(r, str)
+        ]
+        remaining = max_files - len(files)
+        if remaining:
+            for path in collect_schema_files(
+                    dirs, max_files=remaining, max_dirs=max_dirs):
+                add(path)
+                if len(files) >= max_files:
+                    break
+    return files
+
+
+def analyze(texts, cfg, report_files=None, schema_texts=None):
     """texts: {path: content}. report_files limits which files findings are
-    reported FOR; all files still provide duplicate-detection context."""
+    reported FOR; all files still provide duplicate-detection context.
+    schema_texts: {path: content} of schema files defining the repo's message
+    contracts (kept out of texts so they aren't scanned as code)."""
     findings = []
+    messages = schema_messages(schema_texts) if schema_texts else []
     for path, text in texts.items():
         if report_files is not None and path not in report_files:
             continue
@@ -158,6 +261,8 @@ def analyze(texts, cfg, report_files=None):
             findings.extend(check_python(path, text, cfg))
         else:
             findings.extend(check_generic(path, text, cfg, ext))
+        if messages:
+            findings.extend(check_contracts(path, text, cfg, messages))
         if is_test_file(path):
             if ext == PY_EXT:
                 findings.extend(check_python_tests(path, text, cfg))
@@ -242,7 +347,14 @@ def cmd_scan(args):
               % (len(files), MAX_SCAN_FILES), file=sys.stderr)
         files = files[:MAX_SCAN_FILES]
     texts = read_texts(files)
-    findings = analyze(texts, cfg)
+    schema_paths = [p if os.path.isdir(p) else os.path.dirname(os.path.abspath(p)) or "."
+                    for p in (args.paths or ["."])]
+    schema_files = config_schema_files(cfg)
+    remaining = MAX_SCHEMA_FILES - len(schema_files)
+    if remaining:
+        schema_files.extend(collect_schema_files(schema_paths, max_files=remaining))
+    schema_texts = read_texts(sorted(set(schema_files)))
+    findings = analyze(texts, cfg, schema_texts=schema_texts)
     if args.json:
         print(json.dumps([f.to_dict() for f in sort_findings(findings)], indent=2))
     else:

@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package fixtures.robot;
+
+message RobotStatus {
+  string parent_frame = 1;
+  double joint_speed_limit = 2;
+  int32 error_code = 3;
+  string tool_name = 4;
+  bool is_homed = 5;
+}

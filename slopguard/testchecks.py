@@ -24,6 +24,7 @@ MAX_MOCKS_PER_TEST = 5
 LONG_STRING_ASSERT = 48
 BIG_LITERAL_ENTRIES = 8
 MIN_PARAMETRIZE_GROUP = 3
+MIN_PROPERTY_GROUP = 6
 _SLEEP_MODULES = {"asyncio", "time", "trio", "anyio", "gevent", "eventlet"}
 
 
@@ -345,11 +346,13 @@ def _parametrize_candidates(findings, path, tests, cfg):
         if len(fns) < min_group:
             continue
         names = ", ".join(f.name for f in fns[:4]) + ("…" if len(fns) > 4 else "")
-        findings.append(Finding(
-            "parametrize-candidate", "warn", path, fns[0].lineno,
-            "%d tests are identical except for literal values (%s) — collapse into one "
-            "parametrized test so the behavior space is stated in one place"
-            % (len(fns), names)))
+        message = ("%d tests are identical except for literal values (%s) — collapse into one "
+                   "parametrized test so the behavior space is stated in one place"
+                   % (len(fns), names))
+        if len(fns) >= MIN_PROPERTY_GROUP:
+            message += ("; at this many cases, consider stating the rule once as a "
+                        "property-based test (hypothesis) instead of enumerating examples")
+        findings.append(Finding("parametrize-candidate", "warn", path, fns[0].lineno, message))
 
 
 # ---------------------------------------------------------------- JS/TS side
@@ -421,10 +424,13 @@ def check_generic_tests(path, text, cfg, ext):
 
     min_group = cfg.get("min_parametrize_group", MIN_PARAMETRIZE_GROUP)
     for linenos in shapes.values():
-        if len(linenos) >= min_group:
-            findings.append(Finding(
-                "parametrize-candidate", "warn", path, linenos[0],
-                "%d test blocks are identical except for literal values (lines %s) — "
-                "collapse into one it.each/test.each table"
-                % (len(linenos), ", ".join(str(l) for l in linenos))))
+        if len(linenos) < min_group:
+            continue
+        message = ("%d test blocks are identical except for literal values (lines %s) — "
+                   "collapse into one it.each/test.each table"
+                   % (len(linenos), ", ".join(str(l) for l in linenos)))
+        if len(linenos) >= MIN_PROPERTY_GROUP:
+            message += ("; at this many cases, consider stating the rule once as a "
+                        "property-based test (fast-check) instead of enumerating examples")
+        findings.append(Finding("parametrize-candidate", "warn", path, linenos[0], message))
     return findings

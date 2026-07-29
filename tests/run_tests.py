@@ -283,6 +283,397 @@ def test_atomic_installs():
             name.startswith(".slopguard-") for name in os.listdir(td)))
 
 
+def _write_contract_schema(directory):
+    with open(os.path.join(directory, "status.proto"), "w") as fh:
+        fh.write('syntax = "proto3";\nmessage S {\n  string parent_frame = 1;\n'
+                 '  double joint_speed_limit = 2;\n  int32 error_code = 3;\n'
+                 '  string tool_name = 4;\n'
+                 '  string legacy_parent = 5 [json_name = "wireParent"];\n}\n')
+
+
+def test_contract_rules():
+    with tempfile.TemporaryDirectory() as td:
+        _write_contract_schema(td)
+        handler = os.path.join(td, "handler.py")
+        with open(handler, "w") as fh:
+            fh.write('''\
+def respond(state):
+    return {
+        "parentFrame": state.frame,
+        "joint_speed_limit": state.limit,
+        "error_code": state.error,
+        "tool_name": state.tool,
+    }
+''')
+        r = run(["scan", td, "--json", "--fail-on", "never"])
+        rules = {f["rule"]: f["severity"] for f in json.loads(r.stdout)}
+        # parent_frame IS in this schema, so 'parentFrame' is in-sync mapping
+        # (info); it is NOT a drift key.
+        check("in-sync camel mapping is info-level contract-case-skew",
+              rules.get("contract-case-skew") == "info", json.dumps(rules))
+        check("hand-rolled-contract fires at warn", rules.get("hand-rolled-contract") == "warn")
+        check("no drift key when the field exists", "contract-drift-key" not in rules)
+
+        drifted = os.path.join(td, "drifted.py")
+        with open(drifted, "w") as fh:
+            fh.write('''\
+def respond_old(state):
+    return {
+        "joint_speed_limit": state.limit,
+        "error_code": state.error,
+        "tool_name": state.tool,
+        "removedField": state.gone,
+    }
+''')
+        r = run(["scan", drifted, "--json", "--fail-on", "never"])
+        rules = {f["rule"]: f["severity"] for f in json.loads(r.stdout)}
+        check("emitting a field the schema dropped is warn-level contract-drift-key",
+              rules.get("contract-drift-key") == "warn", json.dumps(rules))
+        event = json.dumps({
+            "hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": td,
+            "tool_input": {"file_path": drifted},
+        })
+        r = run(["hook"], stdin_data=event)
+        check("hook discovers sibling schema files",
+              r.returncode == 2 and "contract-drift-key" in r.stderr,
+              "rc=%d %s" % (r.returncode, r.stderr[:200]))
+
+
+def test_contract_schema_formats():
+    def scan_rules(path):
+        r = run(["scan", path, "--json", "--fail-on", "never"])
+        return {f["rule"]: f["severity"] for f in json.loads(r.stdout)}
+
+    with tempfile.TemporaryDirectory() as td:
+        # Message scoping: fields drawn from two unrelated messages must not
+        # combine to legitimize a dict (the flat-vocabulary false positive).
+        with open(os.path.join(td, "two.proto"), "w") as fh:
+            fh.write('syntax = "proto3";\n'
+                     'message A {\n  string alpha_rate = 1;\n  int32 beta_count = 2;\n}\n'
+                     'message B {\n  string gamma_size = 1;\n  int32 delta_mode = 2;\n}\n')
+        mixed = os.path.join(td, "mixed.py")
+        with open(mixed, "w") as fh:
+            fh.write('def emit(s):\n    return {\n        "alpha_rate": s.a,\n'
+                     '        "beta_count": s.b,\n        "gamma_size": s.g,\n'
+                     '        "strayKey": s.x,\n    }\n')
+        rules = scan_rules(mixed)
+        check("cross-message field mixing does not fire contract rules",
+              not rules, json.dumps(rules))
+
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "events.graphql"), "w") as fh:
+            fh.write('type PickEvent {\n  pickId: ID!\n  binLocation: String\n'
+                     '  graspScore: Float\n  toolName: String\n}\n')
+        gql = os.path.join(td, "emitter.py")
+        with open(gql, "w") as fh:
+            fh.write('def emit(e):\n    return {\n        "pickId": e.id,\n'
+                     '        "binLocation": e.bin,\n        "graspScore": e.score,\n'
+                     '        "toolName": e.tool,\n        "conveyorLane": e.lane,\n    }\n')
+        rules = scan_rules(gql)
+        check("GraphQL camel-declared fields match without case-skew",
+              rules.get("hand-rolled-contract") == "warn"
+              and "contract-case-skew" not in rules, json.dumps(rules))
+        check("GraphQL drift key still fires", rules.get("contract-drift-key") == "warn")
+
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "openapi.yaml"), "w") as fh:
+            fh.write('components:\n  schemas:\n    Robot:\n      type: object\n'
+                     '      properties:\n        serial_number:\n          type: string\n'
+                     '        firmware_rev:\n          type: string\n'
+                     '        joint_count:\n          type: integer\n'
+                     '        tool_type:\n          type: string\n')
+        yml = os.path.join(td, "reporter.py")
+        with open(yml, "w") as fh:
+            fh.write('def report(r):\n    return {\n        "serial_number": r.sn,\n'
+                     '        "firmware_rev": r.fw,\n        "joint_count": r.n,\n'
+                     '        "tool_type": r.tool,\n    }\n')
+        rules = scan_rules(yml)
+        check("OpenAPI YAML properties are a schema source",
+              rules.get("hand-rolled-contract") == "warn", json.dumps(rules))
+
+    with tempfile.TemporaryDirectory() as td:
+        # schema_roots config: schemas live outside the handler's subtree.
+        os.makedirs(os.path.join(td, "schemas"))
+        os.makedirs(os.path.join(td, "svc"))
+        with open(os.path.join(td, "schemas", "status.proto"), "w") as fh:
+            fh.write('syntax = "proto3";\nmessage S {\n  string parent_frame = 1;\n'
+                     '  double joint_speed_limit = 2;\n  int32 error_code = 3;\n'
+                     '  string tool_name = 4;\n}\n')
+        with open(os.path.join(td, ".slopguard.json"), "w") as fh:
+            fh.write('{"schema_roots": ["schemas"]}\n')
+        handler = os.path.join(td, "svc", "handler.py")
+        with open(handler, "w") as fh:
+            fh.write('def respond_old(state):\n    return {\n'
+                     '        "joint_speed_limit": state.limit,\n'
+                     '        "error_code": state.error,\n'
+                     '        "tool_name": state.tool,\n'
+                     '        "removedField": state.gone,\n    }\n')
+        event = json.dumps({
+            "hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": td,
+            "tool_input": {"file_path": handler},
+        })
+        r = run(["hook"], stdin_data=event)
+        check("schema_roots config reaches schemas outside the edited subtree",
+              r.returncode == 2 and "contract-drift-key" in r.stderr,
+              "rc=%d %s" % (r.returncode, r.stderr[:200]))
+
+
+def test_contract_block_parsers():
+    from slopguard.contracts import schema_messages
+
+    proto = '''\
+message Outer {
+  string outer_name = 1;
+  int32 outer_count = 2;
+  message Inner {
+    string nested_name = 1;
+    int32 nested_count = 2;
+  }
+  oneof result {
+    string result_name = 3;
+    int32 result_count = 4;
+  }
+}
+'''
+    messages = schema_messages({"nested.proto": proto})
+    by_label = {label: fields for label, fields, _canon_fields in messages}
+    check("nested proto fields stay out of their parent message",
+          by_label["nested.proto Outer"]
+          == {"outer_name", "outer_count", "result_name", "result_count"},
+          repr(messages))
+    check("nested proto messages are still parsed independently",
+          by_label["nested.proto Inner"] == {"nested_name", "nested_count"},
+          repr(messages))
+
+    graphql = '''\
+type Query {
+  """A description may contain an unmatched } brace."""
+  search(
+    userId: ID!
+    pageSize: Int
+  ): Result
+  requestName: String
+  errorCode: Int
+  toolName: String
+}
+'''
+    messages = schema_messages({"query.graphql": graphql})
+    fields = messages[0][1] if messages else set()
+    check("GraphQL descriptions do not break brace matching",
+          {"search", "requestName", "errorCode", "toolName"} <= fields,
+          repr(messages))
+    check("GraphQL arguments are not treated as message fields",
+          not fields & {"userId", "pageSize"}, repr(messages))
+
+
+def test_contract_canon_and_yaml():
+    from slopguard.contracts import _canon, _yaml_properties, check_contracts
+
+    yaml = '''\
+components:
+  schemas:
+    Envelope:
+      properties: # response fields
+        user:
+          type: object
+          properties:
+            "user_name":
+              type: string
+            user_role:
+              type: string
+        tags:
+          type: array
+          items:
+            type: string
+'''
+    property_sets = [fields for _lineno, fields in _yaml_properties(yaml)]
+    check("nested YAML properties become separate messages",
+          {"user", "tags"} in property_sets
+          and {"user_name", "user_role"} in property_sets,
+          repr(property_sets))
+    check("YAML property metadata and list items do not become fields",
+          not any({"type", "items"} & fields for fields in property_sets),
+          repr(property_sets))
+    check("acronym canonicalization does not collide with letter-by-letter snake case",
+          _canon("pickID") == "pick_id" and _canon("pickID") != _canon("pick_i_d"))
+
+    messages = [("schema T", {"requestName"}, {"request_name"})]
+    repeated = '''\
+def emit(state):
+    return {
+        "requestName": state.name,
+        "requestName": state.old_name,
+        "requestName": state.fallback_name,
+        "staleField": state.stale,
+    }
+'''
+    check("duplicate dict keys do not inflate schema overlap",
+          not check_contracts("handler.py", repeated, {}, messages))
+
+
+def test_config_schema_files():
+    import glob
+
+    from slopguard.cli import config_schema_files, is_schema_file, load_config
+
+    with tempfile.TemporaryDirectory() as td:
+        special = os.path.join(td, "event[v1].avsc")
+        second = os.path.join(td, "second.avsc")
+        root = os.path.join(td, "root")
+        os.mkdir(root)
+        for path in (special, second, os.path.join(root, "third.proto")):
+            with open(path, "w") as fh:
+                fh.write("{}")
+
+        cfg = {
+            "_config_dir": td,
+            "contract_schemas": [glob.escape(special), 3, second],
+            "schema_roots": [root, None],
+        }
+        files = config_schema_files(cfg, max_files=2)
+        check("config schema globs support absolute escaped paths",
+              special in files, repr(files))
+        check("configured schemas share one global file cap",
+              len(files) == 2 and os.path.join(root, "third.proto") not in files,
+              repr(files))
+
+        with open(os.path.join(td, ".slopguard.json"), "w") as fh:
+            fh.write("[]")
+        check("non-object config fails open as empty config",
+              isinstance(load_config(td), dict))
+
+    check("common schema naming conventions are recognized",
+          is_schema_file("service.graphqls")
+          and is_schema_file("asyncapi.yaml")
+          and not is_schema_file("payload.json"))
+
+
+def test_contract_false_positive_guards():
+    with tempfile.TemporaryDirectory() as td:
+        _write_contract_schema(td)
+        aliased = os.path.join(td, "aliased.py")
+        with open(aliased, "w") as fh:
+            fh.write('''\
+def respond_wire(state):
+    return {
+        "joint_speed_limit": state.limit,
+        "error_code": state.error,
+        "tool_name": state.tool,
+        "wireParent": state.frame,
+    }
+''')
+        r = run(["scan", aliased, "--json", "--fail-on", "never"])
+        rules = {f["rule"] for f in json.loads(r.stdout)}
+        check("explicit proto json_name alias is not drift",
+              "contract-drift-key" not in rules, json.dumps(sorted(rules)))
+
+        uppercase = os.path.join(td, "uppercase.py")
+        with open(uppercase, "w") as fh:
+            fh.write('''\
+def respond_metadata(state):
+    return {
+        "joint_speed_limit": state.limit,
+        "error_code": state.error,
+        "tool_name": state.tool,
+        "LOCAL_MODE": state.mode,
+    }
+''')
+        r = run(["scan", uppercase, "--json", "--fail-on", "never"])
+        rules = {f["rule"] for f in json.loads(r.stdout)}
+        check("non-camel metadata key is not drift",
+              "contract-drift-key" not in rules, json.dumps(sorted(rules)))
+
+        clean = os.path.join(td, "unrelated.py")
+        with open(clean, "w") as fh:
+            fh.write('''\
+def parent_frame_of(node):
+    note = "parentFrame"
+    return node.parent_frame, note
+''')
+        r = run(["scan", clean, "--json"])
+        check("contract names outside dict keys are ignored",
+              r.returncode == 0 and not json.loads(r.stdout))
+
+
+def test_schema_discovery_caps():
+    from slopguard.cli import collect_schema_files
+
+    with tempfile.TemporaryDirectory() as td:
+        nested = os.path.join(td, "nested")
+        os.mkdir(nested)
+        _write_contract_schema(td)
+        _write_contract_schema(nested)
+        files = collect_schema_files([td], max_files=1)
+        check("schema discovery stops at its file cap", len(files) == 1, repr(files))
+        files = collect_schema_files([td], max_files=40, max_dirs=1)
+        check("hook schema discovery stops at its directory cap",
+              len(files) == 1 and os.path.dirname(files[0]) == td, repr(files))
+
+
+def _property_examples(language):
+    blocks = []
+    for i in range(6):
+        if language == "python":
+            block = ("def test_case_%d():\n    result = normalize(%d)\n"
+                     "    assert result == %d\n" % (i, i, i))
+        else:
+            block = ('it("case %d", () => {\n  const result = normalize(%d);\n'
+                     '  expect(result).toBe(%d);\n});' % (i, i, i))
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
+
+def test_property_suggestion():
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, ".slopguard.json"), "w") as fh:
+            json.dump({"min_parametrize_group": 4}, fh)
+        path = os.path.join(td, "test_examples.py")
+        with open(path, "w") as fh:
+            fh.write(_property_examples("python"))
+        r = run(["scan", path, "--json", "--fail-on", "never"])
+        messages = [
+            f["message"] for f in json.loads(r.stdout)
+            if f["rule"] == "parametrize-candidate"
+        ]
+        check("six Python clones suggest property-based testing",
+              len(messages) == 1 and "hypothesis" in messages[0],
+              json.dumps(messages))
+
+        path = os.path.join(td, "examples.test.ts")
+        with open(path, "w") as fh:
+            fh.write(_property_examples("typescript"))
+        r = run(["scan", path, "--json", "--fail-on", "never"])
+        messages = [
+            f["message"] for f in json.loads(r.stdout)
+            if f["rule"] == "parametrize-candidate"
+        ]
+        check("six TypeScript clones suggest property-based testing",
+              len(messages) == 1 and "fast-check" in messages[0],
+              json.dumps(messages))
+
+
+def test_rule_coverage():
+    """Self-check: every rule slopguard documents must demonstrably fire."""
+    from slopguard.cli import RULES
+
+    fired = set()
+    r = run(["scan", FIXTURES, "--json", "--fail-on", "never"])
+    fired |= {f["rule"] for f in json.loads(r.stdout)}
+    with tempfile.TemporaryDirectory() as td:
+        big = os.path.join(td, "big.py")
+        body = ["def huge(flag):"] + ["    x%d = %d" % (i, i) for i in range(85)]
+        body += ["    if flag:", "        if x1:", "            if x2:",
+                 "                if x3:", "                    if x4:",
+                 "                        return x5", "    return x0", ""]
+        with open(big, "w") as fh:
+            fh.write("\n".join(body))
+        r = run(["scan", big, "--json", "--fail-on", "never"])
+        fired |= {f["rule"] for f in json.loads(r.stdout)}
+    missing = set(RULES) - fired
+    check("every documented rule fires somewhere in the test corpus", not missing,
+          "missing: %s" % sorted(missing))
+
+
 def test_false_positive_guards():
     with tempfile.TemporaryDirectory() as td:
         py_path = os.path.join(td, "test_distinct_behaviors.py")
@@ -316,6 +707,7 @@ def test_delete(fake_clock):
 export const castAdvice = "never cast as any";
 export const loggingExample = "console.log(1)";
 export const catchExample = "catch (error) {}";
+export const directiveExample = "@ts-ignore";
 // Avoid `as any` when a real type is available.
 ''')
         r = run(["scan", ts_path, "--json"])
@@ -460,7 +852,13 @@ def test_hook_garbage_stdin():
 
 
 def main():
-    for fn in (test_scan_fixtures, test_test_suite_rules, test_clean_file,
+    for fn in (test_scan_fixtures, test_test_suite_rules, test_contract_rules,
+               test_contract_schema_formats,
+               test_contract_block_parsers, test_contract_canon_and_yaml,
+               test_config_schema_files,
+               test_contract_false_positive_guards, test_schema_discovery_caps,
+               test_property_suggestion,
+               test_rule_coverage, test_clean_file,
                test_clean_test_file, test_suppression, test_duplicate_function_bindings,
                test_install_command_quoting, test_atomic_installs,
                test_false_positive_guards,

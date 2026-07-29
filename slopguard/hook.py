@@ -13,12 +13,15 @@ import subprocess
 import sys
 from fnmatch import fnmatch
 
-from .cli import analyze, is_checkable, load_config, read_texts
+from .cli import (analyze, collect_schema_files, config_schema_files,
+                  is_checkable, load_config, read_texts)
 from .findings import at_or_above, sort_findings
 
 MAX_TARGET_FILES = 40
 MAX_CONTEXT_FILES = 30
 MAX_REPORT_LINES = 30
+MAX_HOOK_SCHEMA_FILES = 40
+MAX_HOOK_SCHEMA_DIRS = 1000
 STATE_DIR = os.environ.get(
     "SLOPGUARD_STATE_DIR", os.path.expanduser("~/.cache/slopguard"))
 
@@ -55,7 +58,15 @@ def _run(args):
         return 0
 
     texts = read_texts(targets + _context_files(targets))
-    findings = analyze(texts, cfg, report_files=set(targets))
+    configured = config_schema_files(
+        cfg, max_files=MAX_HOOK_SCHEMA_FILES,
+        max_dirs=MAX_HOOK_SCHEMA_DIRS)
+    remaining = MAX_HOOK_SCHEMA_FILES - len(configured)
+    nearby = _nearby_schemas(
+        targets, max_files=remaining,
+        max_dirs=MAX_HOOK_SCHEMA_DIRS) if remaining else []
+    schema_texts = read_texts(sorted(set(configured + nearby)))
+    findings = analyze(texts, cfg, report_files=set(targets), schema_texts=schema_texts)
     blocking = at_or_above(findings, "warn")
     if not blocking:
         return 0
@@ -73,6 +84,19 @@ def _run(args):
         body += "\n... and %d more (run `slopguard scan` for the full list)" % (len(lines) - len(shown))
     print(body, file=sys.stderr)
     return 2
+
+
+def _nearby_schemas(targets, max_files=MAX_HOOK_SCHEMA_FILES,
+                    max_dirs=MAX_HOOK_SCHEMA_DIRS):
+    """Schema files in target directory subtrees, within a hook-time budget."""
+    roots = []
+    for directory in sorted(
+            {os.path.dirname(t) for t in targets}, key=lambda d: (len(d), d)):
+        if not any(directory == root or directory.startswith(root + os.sep)
+                   for root in roots):
+            roots.append(directory)
+    return collect_schema_files(
+        roots, max_files=max_files, max_dirs=max_dirs)
 
 
 def _files_from_tool_input(tool_input, cwd):

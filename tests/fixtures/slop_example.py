@@ -49,4 +49,5 @@ class SessionManager:
 
 class Greeter:  # single-method-class
     def greet(self, who):
-        return "hello " + who
+        legacy = who.upper()  # type: ignore
+        return "hello " + legacy

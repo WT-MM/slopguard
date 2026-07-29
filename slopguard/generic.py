@@ -38,7 +38,7 @@ def check_generic(path, text, cfg, ext):
     if ext in JS_EXTS or ext in {".java", ".cs", ".kt", ".swift", ".scala", ".c", ".cc", ".cpp", ".go"}:
         _empty_catches(findings, path, code)
     if ext in TS_EXTS:
-        _type_escapes(findings, path, code_lines)
+        _type_escapes(findings, path, code_lines, lines)
     if ext in JS_EXTS:
         _console_logs(findings, path, code_lines)
     if ext in PRIVATE_FIELD_EXTS or ext in JS_EXTS:
@@ -181,13 +181,17 @@ def _empty_catches(findings, path, text):
             "empty .catch() silently swallows the rejection — handle or log it"))
 
 
-def _type_escapes(findings, path, lines):
-    for idx, line in enumerate(lines):
+def _type_escapes(findings, path, code_lines, raw_lines):
+    # `as any` is code, so match the masked text; @ts-ignore is a comment
+    # DIRECTIVE, so it must be matched in the raw line the mask erased.
+    for idx, line in enumerate(code_lines):
         if _AS_ANY.search(line):
             findings.append(Finding(
                 "as-any", "warn", path, idx + 1,
                 "`as any` defeats the type checker — type it properly"))
-        if _TS_IGNORE.search(line):
+    for idx, line in enumerate(raw_lines):
+        _, comment = _split_comment(line, "//")
+        if comment is not None and _TS_IGNORE.search(comment):
             findings.append(Finding(
                 "ts-ignore", "warn", path, idx + 1,
                 "@ts-ignore hides a type error — fix the type instead"))

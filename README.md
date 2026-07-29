@@ -66,7 +66,46 @@ and over-specification:
 
 Custom assert helpers are recognized (functions with assert/check/verify/
 expect/validate in their name count as assertions), so helper-based suites
-aren't flagged as assertion-free.
+aren't flagged as assertion-free. Parametrize groups of 6+ additionally
+suggest stating the rule once as a property-based test.
+
+## Contract-drift rules (when message schemas are in the repo)
+
+Code that disagrees with a message schema fails at runtime; when the schema
+is in the repo, it's statically visible. Schema sources: Protobuf
+(`.proto`, message-scoped; `.textproto` instance data, file-scoped), Avro
+(`.avsc`), Thrift (`.thrift`), GraphQL SDL
+(`.graphql`/`.graphqls`/`.gql`), and JSON
+Schema / OpenAPI documents (`*.json`/`*.yaml` named like a schema —
+`*schema*`, `openapi*`, `swagger*`, `asyncapi*`). Discovery is automatic (scan: under the
+scanned paths; hook: each edited file's subtree, capped at 40 schema files
+and 1,000 directories to preserve edit latency), plus two `.slopguard.json`
+keys for schemas living elsewhere: `"schema_roots": ["protos/"]`
+(directories, searched recursively) and
+`"contract_schemas": ["contracts/**/*.avsc"]` (explicit globs), both
+resolved relative to the config file.
+
+Matching is **message-scoped**: a dict literal must substantially match ONE
+message's fields (≥4 string keys, ≥75% of them fields of that message), so
+vocabulary from unrelated messages can't combine to legitimize a stray key.
+camelCase- and snake_case-declared schemas both work — keys are canonicalized
+before matching, and proto `json_name` aliases are honored. Checks apply to
+Python dict literals (proto3's JSON mapping legitimately camelCases in JS/TS):
+
+| rule | sev | catches |
+|---|---|---|
+| contract-drift-key | warn | camelCase key with NO schema field, in a dict whose other keys are schema-defined — a removed/renamed field still being emitted |
+| hand-rolled-contract | warn | dict literal hand-builds a schema-defined message — use the generated type so drift fails at build time |
+| contract-case-skew | info | in-sync hand-mapping (`parentFrame` for existing `parent_frame`) — fragile but currently correct |
+
+## Self-checking
+
+`tests/run_tests.py` includes a scan-mode rule-coverage meta-test: every rule
+listed in `slopguard rules` must demonstrably fire on the test corpus, so an
+analyzer refactor can't silently kill a rule (this caught a real one:
+comment-masking had made `@ts-ignore` undetectable). Separate targeted tests
+cover hook target discovery and blocking behavior; the meta-test does not
+prove every rule is reachable through every hook protocol.
 
 ## Hook behavior
 

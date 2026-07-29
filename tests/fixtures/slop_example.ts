@@ -4,6 +4,7 @@ export class OrderService {
   private retryLimit = 3; // unused-private: declared, never used
 
   async submit(order: unknown): Promise<void> {
+    // @ts-ignore  <- ts-ignore: hides the type error below
     const payload = order as any; // as-any
     // submit the order payload  <- redundant-comment
     try {
