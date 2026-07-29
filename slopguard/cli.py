@@ -1,0 +1,272 @@
+"""slopguard CLI: scan paths, run as an agent hook, install hooks."""
+import argparse
+import json
+import os
+import sys
+
+from . import __version__
+from .duplicates import find_duplicate_blocks, find_duplicate_functions
+from .findings import at_or_above, counts, sort_findings
+from .generic import JS_EXTS, check_generic
+from .pychecks import check_python
+from .testchecks import check_generic_tests, check_python_tests
+
+PY_EXT = ".py"
+SUPPORTED_EXTS = {
+    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".rs",
+    ".java", ".kt", ".swift", ".cs", ".rb", ".php", ".c", ".cc", ".cpp",
+    ".h", ".hpp", ".scala", ".sh",
+}
+IGNORED_DIR_PARTS = {
+    "node_modules", ".git", ".hg", ".venv", "venv", "env", "dist", "build",
+    "target", "vendor", "__pycache__", ".next", ".tox", "site-packages",
+    ".cache", "coverage",
+}
+GENERATED_SUFFIXES = (".min.js", ".min.css", "_pb2.py", "_pb2_grpc.py", ".d.ts")
+MAX_FILE_BYTES = 512 * 1024
+MAX_SCAN_FILES = 4000
+TEST_RELAXED_RULES = {"as-any", "ts-ignore", "duplicate-code", "debug-artifact",
+                      "long-function", "deep-nesting"}
+_TEST_PATH_PARTS = ("/tests/", "/test/", "/__tests__/", "/spec/")
+
+
+def is_test_file(path):
+    base = os.path.basename(path)
+    norm = path.replace(os.sep, "/")
+    return (".test." in base or ".spec." in base or base.startswith("test_")
+            or base.endswith(("_test.py", "_test.go", "_test.ts", "_spec.rb"))
+            or any(part in norm for part in _TEST_PATH_PARTS))
+
+RULES = {
+    "duplicate-function": "error  py       structurally identical function already exists (names normalized)",
+    "dead-code":          "error  py       unreachable statements after return/raise/break/continue",
+    "syntax-error":       "error  py       file does not parse",
+    "duplicate-code":     "warn   all      copy-pasted block (~6+ normalized lines) appears elsewhere",
+    "unused-private":     "warn   py,ts,…  private function/method/field never referenced in its file",
+    "write-only-attr":    "warn   py       self._attr assigned but never read",
+    "unused-import":      "warn   py       import never used",
+    "placeholder-body":   "warn   py       function body is pass/... — looks implemented, does nothing",
+    "swallowed-exception":"warn   py,js,…  except:pass / empty catch block",
+    "bare-except":        "warn   py       bare `except:`",
+    "mutable-default":    "warn   py       mutable default argument",
+    "hedging-comment":    "warn   all      \"in a real implementation...\"-style cop-out comments",
+    "redundant-comment":  "warn   all      comment restates the code (warn if fully, info if mostly)",
+    "long-function":      "warn   py       function longer than max_function_lines (default 80)",
+    "deep-nesting":       "warn   py       nesting deeper than max_nesting (default 4)",
+    "as-any":             "warn   ts       `as any` cast",
+    "ts-ignore":          "warn   ts       @ts-ignore / @ts-nocheck",
+    "no-assert-test":     "warn   tests    test never asserts — only proves the code doesn't crash",
+    "mock-only-test":     "warn   tests    every assertion is a mock-call assertion — tests wiring, not behavior",
+    "mock-echo-test":     "warn   tests    asserts the exact value the mock was told to return",
+    "tautological-assert":"warn   tests    assert True / expect(x).toBe(x) — always passes",
+    "conditional-assert": "warn   tests    assertion inside an `if` — only checks on some paths",
+    "brittle-exact-string":"warn  tests    equality against a long literal string",
+    "overspecified-assert":"warn  tests    equality against a big literal dict/list — pins every field",
+    "parametrize-candidate":"warn tests    3+ tests identical except literals — collapse to one parametrized test",
+    "private-poke-test":  "warn   tests    test reads `_private` internals instead of the public API",
+    "excessive-mocking":  "warn   tests    6+ mocks in one test — tests the wiring diagram",
+    "sleep-in-test":      "warn   tests    real sleep/setTimeout wait — slow and flaky",
+    "type-ignore":        "info   py       `# type: ignore`",
+    "single-method-class":"info   py       class wrapping a single method",
+    "debug-artifact":     "info   py,js    print()/console.log leftovers",
+}
+
+
+def load_config(start_dir):
+    cfg = {}
+    d = os.path.abspath(start_dir)
+    while True:
+        candidate = os.path.join(d, ".slopguard.json")
+        if os.path.isfile(candidate):
+            try:
+                with open(candidate) as fh:
+                    cfg = json.load(fh)
+            except (OSError, ValueError):
+                cfg = {}
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    env_disable = os.environ.get("SLOPGUARD_DISABLE_RULES", "")
+    if env_disable:
+        cfg.setdefault("disable", [])
+        cfg["disable"] = list(cfg["disable"]) + [r.strip() for r in env_disable.split(",") if r.strip()]
+    return cfg
+
+
+def is_checkable(path):
+    parts = set(os.path.normpath(path).split(os.sep))
+    if parts & IGNORED_DIR_PARTS:
+        return False
+    base = os.path.basename(path)
+    if base.endswith(GENERATED_SUFFIXES):
+        return False
+    ext = os.path.splitext(base)[1].lower()
+    if ext not in SUPPORTED_EXTS:
+        return False
+    try:
+        if os.path.getsize(path) > MAX_FILE_BYTES:
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def _walk_checkable(directory):
+    for root, dirs, names in os.walk(directory):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIR_PARTS and not d.startswith(".")]
+        for name in sorted(names):
+            fp = os.path.join(root, name)
+            if is_checkable(fp):
+                yield fp
+
+
+def collect_files(paths):
+    files = []
+    for p in paths:
+        p = os.path.abspath(p)
+        if os.path.isfile(p) and is_checkable(p):
+            files.append(p)
+        elif os.path.isdir(p):
+            files.extend(_walk_checkable(p))
+    return files
+
+
+def read_texts(files):
+    texts = {}
+    for f in files:
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                texts[f] = fh.read()
+        except OSError:
+            continue
+    return texts
+
+
+def analyze(texts, cfg, report_files=None):
+    """texts: {path: content}. report_files limits which files findings are
+    reported FOR; all files still provide duplicate-detection context."""
+    findings = []
+    for path, text in texts.items():
+        if report_files is not None and path not in report_files:
+            continue
+        ext = os.path.splitext(path)[1].lower()
+        if ext == PY_EXT:
+            findings.extend(check_python(path, text, cfg))
+        else:
+            findings.extend(check_generic(path, text, cfg, ext))
+        if is_test_file(path):
+            if ext == PY_EXT:
+                findings.extend(check_python_tests(path, text, cfg))
+            elif ext in JS_EXTS:
+                findings.extend(check_generic_tests(path, text, cfg, ext))
+
+    findings.extend(find_duplicate_blocks(texts))
+    findings.extend(find_duplicate_functions(
+        {p: t for p, t in texts.items() if p.endswith(PY_EXT)}))
+
+    if report_files is not None:
+        findings = [f for f in findings if f.file in report_files]
+
+    # Patterns that are conventional in tests (mock casts, repeated setup
+    # blocks) drop to info there instead of blocking.
+    for f in findings:
+        if f.severity == "warn" and f.rule in TEST_RELAXED_RULES and is_test_file(f.file):
+            f.severity = "info"
+
+    disabled = set(cfg.get("disable", []))
+    findings = [f for f in findings if f.rule not in disabled]
+    return suppress_ignored(findings, texts)
+
+
+def suppress_ignored(findings, texts):
+    """Drop findings whose line (or the line above) carries slopguard:ignore."""
+    kept = []
+    line_cache = {}
+    for f in findings:
+        lines = line_cache.get(f.file)
+        if lines is None:
+            lines = texts.get(f.file, "").splitlines()
+            line_cache[f.file] = lines
+        window = " ".join(lines[max(0, f.line - 2):f.line])
+        if "slopguard:ignore" not in window:
+            kept.append(f)
+    return kept
+
+
+def print_report(findings, out=sys.stdout):
+    for f in sort_findings(findings):
+        out.write(f.format() + "\n")
+    c = counts(findings)
+    out.write("\n%d finding(s): %d error, %d warn, %d info\n"
+              % (len(findings), c["error"], c["warn"], c["info"]))
+
+
+def cmd_scan(args):
+    cfg = load_config(args.paths[0] if args.paths else ".")
+    for rule in args.disable or []:
+        cfg.setdefault("disable", []).append(rule)
+    files = collect_files(args.paths or ["."])
+    if not files:
+        print("slopguard: no checkable files found", file=sys.stderr)
+        return 0
+    if len(files) > MAX_SCAN_FILES:
+        print("slopguard: %d checkable files found — scanning only the first %d. "
+              "Point slopguard at a narrower path for full coverage."
+              % (len(files), MAX_SCAN_FILES), file=sys.stderr)
+        files = files[:MAX_SCAN_FILES]
+    texts = read_texts(files)
+    findings = analyze(texts, cfg)
+    if args.json:
+        print(json.dumps([f.to_dict() for f in sort_findings(findings)], indent=2))
+    else:
+        print_report(findings)
+    fail_on = args.fail_on or cfg.get("fail_on", "warn")
+    if fail_on != "never" and at_or_above(findings, fail_on):
+        return 1
+    return 0
+
+
+def cmd_rules(_args):
+    for rule, desc in RULES.items():
+        print("%-22s %s" % (rule, desc))
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="slopguard",
+        description="Static checks for the failure modes of AI-generated code.")
+    parser.add_argument("--version", action="version", version="slopguard %s" % __version__)
+    sub = parser.add_subparsers(dest="command")
+
+    p_scan = sub.add_parser("scan", help="scan files/directories")
+    p_scan.add_argument("paths", nargs="*", default=["."])
+    p_scan.add_argument("--json", action="store_true")
+    p_scan.add_argument("--fail-on", choices=["error", "warn", "never"])
+    p_scan.add_argument("--disable", action="append", metavar="RULE")
+    p_scan.set_defaults(func=cmd_scan)
+
+    p_hook = sub.add_parser("hook", help="run as a Claude Code / Codex hook (JSON on stdin)")
+    p_hook.add_argument("--agent", choices=["claude", "codex"], default="claude")
+    p_hook.set_defaults(func=None)  # resolved lazily to keep hook startup light
+
+    p_inst = sub.add_parser("install", help="wire the hook into an agent's config")
+    p_inst.add_argument("agent", choices=["claude", "codex"])
+    p_inst.set_defaults(func=None)
+
+    p_rules = sub.add_parser("rules", help="list rules")
+    p_rules.set_defaults(func=cmd_rules)
+
+    args = parser.parse_args(argv)
+    if args.command == "hook":
+        from .hook import run_hook
+        return run_hook(args)
+    if args.command == "install":
+        from .install import run_install
+        return run_install(args)
+    if not args.command:
+        parser.print_help()
+        return 0
+    return args.func(args)
