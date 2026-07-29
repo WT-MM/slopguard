@@ -323,6 +323,27 @@ export const catchExample = "catch (error) {}";
         check("generic rules ignore comments and strings",
               r.returncode == 0 and not found, json.dumps(found)[:300])
 
+        go_path = os.path.join(td, "doc.go")
+        with open(go_path, "w") as fh:
+            fh.write('''\
+package store
+
+// Store persists application records.
+type Store interface {
+\t// Delete an application
+\tDelete(id string) error
+}
+
+// NewStore returns a Store backed by the given database.
+func NewStore(db string) Store {
+\treturn nil
+}
+''')
+        r = run(["scan", go_path, "--json"])
+        found = json.loads(r.stdout)
+        check("godoc declaration comments are not redundant-comment",
+              r.returncode == 0 and not found, json.dumps(found)[:300])
+
 
 def test_hook_posttooluse():
     with tempfile.TemporaryDirectory() as td:

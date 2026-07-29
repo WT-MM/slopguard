@@ -125,6 +125,11 @@ def _split_comment(line, marker):
     return line, None
 
 
+# Go declarations (and interface methods / struct fields with exported names)
+# carry godoc comments that begin with the identifier by convention.
+_GO_DECL = re.compile(r"^(func|type|var|const)\b|^[A-Z]\w*[\s(]")
+
+
 def _comments(findings, path, lines, ext):
     marker = "#" if ext in HASH_COMMENT_EXTS else "//"
 
@@ -152,6 +157,8 @@ def _comments(findings, path, lines, ext):
         code = code_part.strip() or next_code_line(idx + 1)
         if not code:
             continue
+        if ext == ".go" and not code_part.strip() and _GO_DECL.match(code):
+            continue  # godoc requires doc comments to restate the identifier
         level = redundancy(comment, code)
         if level == "full":
             findings.append(Finding(
