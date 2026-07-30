@@ -62,7 +62,7 @@ def _context(path, line):
 def cmd_sample(args):
     known = {r["fingerprint"] for r in _read_jsonl(QUEUE)}
     known |= {r["fingerprint"] for r in _read_jsonl(LABELS)}
-    by_rule = collections.defaultdict(list)
+    by_rule = collections.defaultdict(dict)
     for repo in args.repos:
         proc = subprocess.run(
             [sys.executable, BIN, "scan", repo, "--json", "--fail-on", "never",
@@ -77,12 +77,17 @@ def cmd_sample(args):
         for f in findings:
             if f["severity"] != "info" and f["fingerprint"] not in known:
                 f["repo"] = repo
-                by_rule[f["rule"]].append(f)
+                # Forked repos can produce the same root-relative fingerprint.
+                # Queue it once: labels and reports are fingerprint-keyed too.
+                by_rule[f["rule"]].setdefault(f["fingerprint"], f)
 
     queued = []
     for rule in sorted(by_rule):
-        # sort by fingerprint: stable pseudo-random spread across files
-        picks = sorted(by_rule[rule], key=lambda f: f["fingerprint"])[:args.per_rule]
+        # A cryptographic fingerprint gives deterministic bottom-k sampling,
+        # uniform over unique findings (not stratified by file or repository).
+        picks = sorted(
+            by_rule[rule].values(),
+            key=lambda f: f["fingerprint"])[:args.per_rule]
         for f in picks:
             queued.append({
                 "fingerprint": f["fingerprint"], "rule": rule, "repo": f["repo"],
@@ -129,10 +134,17 @@ def cmd_report(_args):
     overall = "%.0f%%" % (100.0 * total_tp / (total_tp + total_fp)) if (total_tp + total_fp) else "—"
     print("\noverall precision (unanimous labels): %s over %d labeled finding(s)"
           % (overall, sum(sum(c.values()) for c in stats.values())))
+    compared = [votes for votes in per_fp.values() if len(votes) > 1]
+    agreed = sum(len(set(votes.values())) == 1 for votes in compared)
+    if compared:
+        print("labeler agreement: %d/%d (%.0f%%)"
+              % (agreed, len(compared), 100.0 * agreed / len(compared)))
     if disagreements:
         print("\n%d disagreement(s) to adjudicate:" % len(disagreements))
         for rule, fp, votes in disagreements[:20]:
             print("  %s %s %s" % (rule, fp, votes))
+        if len(disagreements) > 20:
+            print("  ... and %d more" % (len(disagreements) - 20))
     return 0
 
 

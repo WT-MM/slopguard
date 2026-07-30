@@ -40,20 +40,37 @@ def at_or_above(findings, severity):
 
 def add_fingerprints(findings, texts, root):
     """Stable identity per finding: rule + root-relative path + the flagged
-    line's content + occurrence index. Content-based, so findings survive
-    line-number drift from edits elsewhere in the file; the occurrence index
-    disambiguates identical lines."""
-    seen = {}
-    for f in sorted(findings, key=lambda f: (f.file, f.line, f.rule)):
+    line's content + its occurrence in the source. Content-based, so findings
+    survive line-number drift from edits elsewhere in the file. Counting
+    source lines rather than emitted findings keeps suppression and disabled
+    rules from transferring an identity to another identical line."""
+    line_occurrences = {}
+    for path, text in texts.items():
+        seen_content = {}
+        occurrences = {}
+        for lineno, line in enumerate(text.splitlines(), 1):
+            content = line.strip()
+            occurrences[lineno] = seen_content.get(content, 0)
+            seen_content[content] = occurrences[lineno] + 1
+        line_occurrences[path] = occurrences
+
+    same_line = {}
+    ordered = sorted(
+        findings,
+        key=lambda f: (f.file, f.line, f.rule, f.message, f.severity))
+    for f in ordered:
         try:
             rel = os.path.relpath(f.file, root)
         except ValueError:
             rel = f.file
         lines = texts.get(f.file, "").splitlines()
         content = lines[f.line - 1].strip() if 0 < f.line <= len(lines) else ""
-        key = (f.rule, rel, content)
-        occurrence = seen.get(key, 0)
-        seen[key] = occurrence + 1
+        occurrence = line_occurrences.get(f.file, {}).get(f.line, f.line)
+        key = (f.rule, rel, f.line, content)
+        suboccurrence = same_line.get(key, 0)
+        same_line[key] = suboccurrence + 1
         raw = "%s|%s|%s|%d" % (f.rule, rel, content, occurrence)
+        if suboccurrence:
+            raw += "|%d" % suboccurrence
         f.fingerprint = hashlib.blake2b(raw.encode(), digest_size=8).hexdigest()
     return findings

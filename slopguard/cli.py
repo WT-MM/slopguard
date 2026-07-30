@@ -1,11 +1,14 @@
 """slopguard CLI: scan paths, run as an agent hook, install hooks."""
 import argparse
+import contextlib
 import glob as globlib
 import io
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 import tokenize
 
 from . import __version__
@@ -315,9 +318,37 @@ def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False,
 BASELINE_NAME = ".slopguard-baseline.json"
 
 
+def project_root(start_dir, cfg=None):
+    """Stable root for fingerprints and a new baseline.
+
+    Prefer explicit project markers over the scanned subdirectory. For
+    configless, non-git trees invoked through a relative path, the caller's
+    working directory is the least surprising project root."""
+    relative_start = not os.path.isabs(start_dir)
+    if cfg and cfg.get("_config_dir"):
+        return os.path.abspath(cfg["_config_dir"])
+    d = os.path.abspath(start_dir)
+    if os.path.isfile(d):
+        d = os.path.dirname(d)
+    probe = d
+    while True:
+        if os.path.exists(os.path.join(probe, ".git")):
+            return probe
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    if relative_start:
+        cwd = os.path.abspath(os.getcwd())
+        with contextlib.suppress(ValueError):
+            if os.path.commonpath((cwd, d)) == cwd:
+                return cwd
+    return d
+
+
 def find_baseline(start_dir):
-    """Walk up from start_dir; returns (baseline_path, fingerprint_set) or
-    (None, set()). The baseline file's directory is the fingerprint root."""
+    """Walk up from start_dir; returns (baseline_path, fingerprint_mapping)
+    or (None, {}). The baseline file's directory is the fingerprint root."""
     d = os.path.abspath(start_dir)
     while True:
         candidate = os.path.join(d, BASELINE_NAME)
@@ -325,12 +356,20 @@ def find_baseline(start_dir):
             try:
                 with open(candidate) as fh:
                     data = json.load(fh)
-                return candidate, set(data.get("fingerprints", {}))
-            except (OSError, ValueError):
-                return candidate, set()
+                entries = data.get("fingerprints", {})
+                if not isinstance(data, dict) or not isinstance(entries, dict):
+                    return candidate, {}
+                entries = {
+                    fp: entry for fp, entry in entries.items()
+                    if isinstance(fp, str) and isinstance(entry, dict)
+                    and isinstance(entry.get("file"), str)
+                }
+                return candidate, entries
+            except (AttributeError, OSError, TypeError, ValueError):
+                return candidate, {}
         parent = os.path.dirname(d)
         if parent == d:
-            return None, set()
+            return None, {}
         d = parent
 
 
@@ -342,18 +381,57 @@ def apply_baseline(findings, baseline_fps):
     return kept, len(findings) - len(kept)
 
 
-def write_baseline(path, findings):
-    entries = {
+def write_baseline(path, findings, preserved=None):
+    entries = dict(preserved or {})
+    entries.update({
         f.fingerprint: {"rule": f.rule, "file": os.path.relpath(f.file, os.path.dirname(path)),
                         "line": f.line}
         for f in at_or_above(findings, "warn")
-    }
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump({"version": 1, "fingerprints": entries}, fh, indent=1, sort_keys=True)
-        fh.write("\n")
-    os.replace(tmp, path)
+    })
+    content = json.dumps(
+        {"version": 1, "fingerprints": entries}, indent=1, sort_keys=True) + "\n"
+    directory = os.path.dirname(path) or "."
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mode = None
+    fd, tmp = tempfile.mkstemp(prefix=".slopguard-baseline-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fd = None
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
     return len(entries)
+
+
+def _baseline_entry_in_scope(entry, baseline_path, paths):
+    """Whether a stored finding belongs to the paths being ratcheted."""
+    rel = entry.get("file")
+    if not isinstance(rel, str):
+        return False
+    target = os.path.abspath(os.path.join(os.path.dirname(baseline_path), rel))
+    for raw in paths or ["."]:
+        scope = os.path.abspath(raw)
+        if os.path.isdir(scope):
+            try:
+                if os.path.commonpath((scope, target)) == scope:
+                    return True
+            except ValueError:
+                continue
+        elif target == scope:
+            return True
+    return False
 
 
 def suppress_ignored(findings, texts):
@@ -435,7 +513,8 @@ def _scan_findings(args):
     files = collect_files(args.paths or ["."])
     if not files:
         return None, cfg, None
-    if len(files) > MAX_SCAN_FILES:
+    truncated = len(files) > MAX_SCAN_FILES
+    if truncated:
         print("slopguard: %d checkable files found — scanning only the first %d. "
               "Point slopguard at a narrower path for full coverage."
               % (len(files), MAX_SCAN_FILES), file=sys.stderr)
@@ -449,13 +528,14 @@ def _scan_findings(args):
         schema_files.extend(collect_schema_files(schema_paths, max_files=remaining))
     schema_texts = read_texts(sorted(set(schema_files)))
 
-    start_dir = start if os.path.isdir(start) else os.path.dirname(os.path.abspath(start))
-    baseline_path, baseline_fps = find_baseline(start_dir)
+    start_dir = start if os.path.isdir(start) else os.path.dirname(start) or "."
+    baseline_path, baseline_entries = find_baseline(start_dir)
     root = (os.path.dirname(baseline_path) if baseline_path
-            else cfg.get("_config_dir") or os.path.abspath(start_dir))
+            else project_root(start_dir, cfg))
     findings = analyze(texts, cfg, schema_texts=schema_texts, parallel=True,
                        fingerprint_root=root)
-    return (findings, baseline_fps), cfg, baseline_path or os.path.join(root, BASELINE_NAME)
+    return ((findings, baseline_entries, truncated), cfg,
+            baseline_path or os.path.join(root, BASELINE_NAME))
 
 
 def cmd_scan(args):
@@ -463,7 +543,7 @@ def cmd_scan(args):
     if result is None:
         print("slopguard: no checkable files found", file=sys.stderr)
         return 0
-    findings, baseline_fps = result
+    findings, baseline_fps, _truncated = result
     if args.no_baseline:
         baseline_fps = set()
     findings, hidden = apply_baseline(findings, baseline_fps)
@@ -485,11 +565,22 @@ def cmd_baseline(args):
     if result is None:
         print("slopguard: no checkable files found", file=sys.stderr)
         return 1
-    findings, existing = result
+    findings, existing, truncated = result
+    if truncated:
+        print("slopguard: refusing to write a baseline from a truncated scan; "
+              "use narrower paths", file=sys.stderr)
+        return 1
     if args.update:
         current = {f.fingerprint for f in at_or_above(findings, "warn")}
-        findings = [f for f in findings if f.fingerprint in (existing & current)]
-        n = write_baseline(baseline_path, findings)
+        findings = [
+            f for f in findings
+            if f.fingerprint in (set(existing) & current)
+        ]
+        preserved = {
+            fp: entry for fp, entry in existing.items()
+            if not _baseline_entry_in_scope(entry, baseline_path, args.paths)
+        }
+        n = write_baseline(baseline_path, findings, preserved)
         print("baseline updated: %d fingerprint(s) remain (fixed findings removed, "
               "new ones stay hot) — %s" % (n, baseline_path))
     else:

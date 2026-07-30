@@ -864,6 +864,88 @@ def test_parallel_scan_determinism():
               first.stdout == second.stdout)
 
 
+def test_fingerprint_identity():
+    from slopguard.findings import Finding, add_fingerprints
+
+    path = "/repo/mod.py"
+    texts = {path: "import os\nimport os\n"}
+    second_only = [Finding("unused-import", "warn", path, 2, "second")]
+    add_fingerprints(second_only, texts, "/repo")
+    both = [
+        Finding("unused-import", "warn", path, 1, "first"),
+        Finding("unused-import", "warn", path, 2, "second"),
+    ]
+    add_fingerprints(both, texts, "/repo")
+    check("suppression cannot transfer an identical line's fingerprint",
+          second_only[0].fingerprint == both[1].fingerprint
+          and second_only[0].fingerprint != both[0].fingerprint)
+
+    forward = [
+        Finding("unused-import", "warn", path, 1, "os"),
+        Finding("unused-import", "warn", path, 1, "sys"),
+    ]
+    reverse = list(reversed([
+        Finding("unused-import", "warn", path, 1, "os"),
+        Finding("unused-import", "warn", path, 1, "sys"),
+    ]))
+    add_fingerprints(forward, texts, "/repo")
+    add_fingerprints(reverse, texts, "/repo")
+    check("same-line fingerprint assignment is deterministic",
+          {f.message: f.fingerprint for f in forward}
+          == {f.message: f.fingerprint for f in reverse})
+
+    renamed = [Finding("unused-import", "warn", "/repo/renamed.py", 2, "second")]
+    add_fingerprints(renamed, {"/repo/renamed.py": texts[path]}, "/repo")
+    check("file renames conservatively resurface findings",
+          renamed[0].fingerprint != second_only[0].fingerprint)
+
+
+def test_baseline_roots_and_partial_updates():
+    with tempfile.TemporaryDirectory() as td:
+        first_dir = os.path.join(td, "first")
+        second_dir = os.path.join(td, "second")
+        os.makedirs(first_dir)
+        os.makedirs(second_dir)
+        first = os.path.join(first_dir, "one.py")
+        second = os.path.join(second_dir, "two.py")
+        with open(first, "w") as fh:
+            fh.write("import os\n")
+        with open(second, "w") as fh:
+            fh.write("import sys\n")
+        subprocess.run(["git", "-C", td, "init", "-q"], check=True)
+
+        r = run(["baseline", first_dir])
+        baseline = os.path.join(td, ".slopguard-baseline.json")
+        check("baseline path uses the Git root, not the scanned subdirectory",
+              r.returncode == 0 and os.path.isfile(baseline)
+              and not os.path.exists(os.path.join(first_dir, ".slopguard-baseline.json")),
+              r.stdout[:200])
+        event = posttool_event(td, first)
+        r = run(["hook"], stdin_data=event)
+        check("hook discovers a baseline written from a subdirectory scan",
+              r.returncode == 0, "rc=%d %s" % (r.returncode, r.stderr[:200]))
+
+        r = run(["baseline", td])
+        os.chmod(baseline, 0o640)
+        r = run(["baseline", first_dir, "--update"])
+        with open(baseline) as fh:
+            entries = json.load(fh)["fingerprints"]
+        files = {entry["file"] for entry in entries.values()}
+        check("partial baseline update preserves findings outside its path",
+              r.returncode == 0
+              and files == {"first/one.py", "second/two.py"}, repr(files))
+        check("baseline updates preserve file mode",
+              os.stat(baseline).st_mode & 0o777 == 0o640,
+              oct(os.stat(baseline).st_mode & 0o777))
+
+        with open(baseline, "w") as fh:
+            fh.write("[]\n")
+        r = run(["scan", td, "--json", "--fail-on", "never"])
+        check("malformed baseline shape fails open",
+              r.returncode == 0 and len(json.loads(r.stdout)) == 2,
+              "rc=%d %s" % (r.returncode, r.stderr[:200]))
+
+
 def test_baseline_ratchet():
     src_v1 = "import os\n\n\ndef f(x=[]):\n    return x\n"
     with tempfile.TemporaryDirectory() as td:
@@ -1124,6 +1206,7 @@ def main():
                test_diverged_duplicates, test_baseline_ratchet, test_diverged_candidate_recall_and_reporting,
                test_diverged_token_and_decorator_guards,
                test_parallel_scan_determinism,
+               test_fingerprint_identity, test_baseline_roots_and_partial_updates,
                test_property_suggestion,
                test_rule_coverage, test_clean_file,
                test_clean_test_file, test_suppression, test_duplicate_function_bindings,

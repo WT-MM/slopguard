@@ -15,7 +15,7 @@ from fnmatch import fnmatch
 
 from .cli import (analyze, apply_baseline, collect_schema_files,
                   config_schema_files, find_baseline, is_checkable,
-                  load_config, read_texts)
+                  load_config, project_root, read_texts)
 from .findings import at_or_above, sort_findings
 
 MAX_TARGET_FILES = 40
@@ -68,7 +68,8 @@ def _run(args):
         max_dirs=MAX_HOOK_SCHEMA_DIRS) if remaining else []
     schema_texts = read_texts(sorted(set(configured + nearby)))
     baseline_path, baseline_fps = find_baseline(cwd)
-    root = os.path.dirname(baseline_path) if baseline_path else None
+    root = (os.path.dirname(baseline_path) if baseline_path
+            else project_root(cwd, cfg))
     findings = analyze(texts, cfg, report_files=set(targets),
                        schema_texts=schema_texts, fingerprint_root=root)
     findings, _hidden = apply_baseline(findings, baseline_fps)
