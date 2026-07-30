@@ -682,6 +682,44 @@ def test_property_suggestion():
               json.dumps(messages))
 
 
+def test_diverged_duplicates():
+    r = run(["scan", os.path.join(FIXTURES, "diverged_a.py"),
+             os.path.join(FIXTURES, "diverged_b.py"), "--json", "--fail-on", "never"])
+    found = [f for f in json.loads(r.stdout) if f["rule"] == "diverged-duplicate"]
+    check("diverged copies are detected", len(found) == 1, json.dumps(found)[:300])
+    check("diverged finding names both sides",
+          found and "sync_inventory" in found[0]["message"]
+          and "diverged_a.py" in found[0]["message"], found[0]["message"] if found else "")
+
+    with tempfile.TemporaryDirectory() as td:
+        # Identical-modulo-literals pairs belong to duplicate-function, not
+        # diverged-duplicate (literals are normalized, so J would be ~1.0).
+        for name, factor in (("m1.py", 10), ("m2.py", 99)):
+            with open(os.path.join(td, name), "w") as fh:
+                fh.write('''\
+def scale_all(values, logger):
+    scaled = []
+    for value in values:
+        if value is None:
+            logger.warning("missing value")
+            continue
+        adjusted = value * %d + %d
+        if adjusted > %d:
+            adjusted = %d
+        scaled.append(adjusted)
+    logger.info("scaled %%d values", len(scaled))
+    return scaled
+''' % (factor, factor + 1, factor * 100, factor * 100))
+        r = run(["scan", td, "--json", "--fail-on", "never"])
+        found = json.loads(r.stdout)
+        param = [f for f in found if f["rule"] == "diverged-duplicate"]
+        check("literal-only variants get the parameterize message",
+              len(param) == 1 and "parameterize" in param[0]["message"],
+              json.dumps(param)[:300])
+        check("literal-only variants are not structural duplicates",
+              "duplicate-function" not in [f["rule"] for f in found])
+
+
 def test_rule_coverage():
     """Self-check: every rule slopguard documents must demonstrably fire."""
     from slopguard.cli import RULES
@@ -887,6 +925,7 @@ def main():
                test_contract_block_parsers, test_contract_canon_and_yaml,
                test_config_schema_files,
                test_contract_false_positive_guards, test_schema_discovery_caps,
+               test_diverged_duplicates,
                test_property_suggestion,
                test_rule_coverage, test_clean_file,
                test_clean_test_file, test_suppression, test_duplicate_function_bindings,

@@ -10,7 +10,8 @@ import tokenize
 
 from . import __version__
 from .contracts import check_contracts, schema_messages
-from .duplicates import find_duplicate_blocks, find_duplicate_functions
+from .duplicates import (find_diverged_duplicates, find_duplicate_blocks,
+                         find_duplicate_functions)
 from .findings import at_or_above, counts, sort_findings
 from .generic import HASH_COMMENT_EXTS, JS_EXTS, _split_comment, check_generic
 from .pychecks import check_python
@@ -38,7 +39,7 @@ MAX_SCHEMA_FILES = 200
 MAX_FILE_BYTES = 512 * 1024
 MAX_SCAN_FILES = 4000
 TEST_RELAXED_RULES = {"as-any", "ts-ignore", "duplicate-code", "debug-artifact",
-                      "long-function", "deep-nesting",
+                      "long-function", "deep-nesting", "diverged-duplicate",
                       "hand-rolled-contract", "contract-drift-key"}
 _TEST_PATH_PARTS = ("/tests/", "/test/", "/__tests__/", "/spec/")
 
@@ -54,6 +55,7 @@ RULES = {
     "duplicate-function": "error  py       structurally identical function already exists (names normalized)",
     "dead-code":          "error  py       unreachable statements after return/raise/break/continue",
     "syntax-error":       "error  py       file does not parse",
+    "diverged-duplicate": "warn   py       function ~60-97% identical to another — a fork drifting apart",
     "duplicate-code":     "warn   all      copy-pasted block (~6+ normalized lines) appears elsewhere",
     "unused-private":     "warn   py,ts,…  private function/method/field never referenced in its file",
     "write-only-attr":    "warn   py       self._attr assigned but never read",
@@ -246,31 +248,50 @@ def config_schema_files(cfg, max_files=MAX_SCHEMA_FILES, max_dirs=None):
     return files
 
 
-def analyze(texts, cfg, report_files=None, schema_texts=None):
+def _file_findings(item):
+    """Per-file rule passes; module-level so multiprocessing can pickle it."""
+    path, text, cfg, messages = item
+    findings = []
+    ext = os.path.splitext(path)[1].lower()
+    if ext == PY_EXT:
+        findings.extend(check_python(path, text, cfg))
+    else:
+        findings.extend(check_generic(path, text, cfg, ext))
+    if messages:
+        findings.extend(check_contracts(path, text, cfg, messages))
+    if is_test_file(path):
+        if ext == PY_EXT:
+            findings.extend(check_python_tests(path, text, cfg))
+        elif ext in JS_EXTS:
+            findings.extend(check_generic_tests(path, text, cfg, ext))
+    return findings
+
+
+PARALLEL_MIN_FILES = 200  # process pool amortizes only on sizable scans
+
+
+def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False):
     """texts: {path: content}. report_files limits which files findings are
     reported FOR; all files still provide duplicate-detection context.
     schema_texts: {path: content} of schema files defining the repo's message
     contracts (kept out of texts so they aren't scanned as code)."""
     findings = []
     messages = schema_messages(schema_texts) if schema_texts else []
-    for path, text in texts.items():
-        if report_files is not None and path not in report_files:
-            continue
-        ext = os.path.splitext(path)[1].lower()
-        if ext == PY_EXT:
-            findings.extend(check_python(path, text, cfg))
-        else:
-            findings.extend(check_generic(path, text, cfg, ext))
-        if messages:
-            findings.extend(check_contracts(path, text, cfg, messages))
-        if is_test_file(path):
-            if ext == PY_EXT:
-                findings.extend(check_python_tests(path, text, cfg))
-            elif ext in JS_EXTS:
-                findings.extend(check_generic_tests(path, text, cfg, ext))
+    items = [(path, text, cfg, messages) for path, text in texts.items()
+             if report_files is None or path in report_files]
+    if parallel and len(items) >= PARALLEL_MIN_FILES:
+        import multiprocessing
+        with multiprocessing.Pool() as pool:
+            for batch in pool.imap_unordered(_file_findings, items, chunksize=16):
+                findings.extend(batch)
+    else:
+        for item in items:
+            findings.extend(_file_findings(item))
 
     findings.extend(find_duplicate_blocks(texts))
     findings.extend(find_duplicate_functions(
+        {p: t for p, t in texts.items() if p.endswith(PY_EXT)}))
+    findings.extend(find_diverged_duplicates(
         {p: t for p, t in texts.items() if p.endswith(PY_EXT)}))
 
     if report_files is not None:
@@ -378,7 +399,7 @@ def cmd_scan(args):
     if remaining:
         schema_files.extend(collect_schema_files(schema_paths, max_files=remaining))
     schema_texts = read_texts(sorted(set(schema_files)))
-    findings = analyze(texts, cfg, schema_texts=schema_texts)
+    findings = analyze(texts, cfg, schema_texts=schema_texts, parallel=True)
     if args.json:
         print(json.dumps([f.to_dict() for f in sort_findings(findings)], indent=2))
     else:

@@ -36,6 +36,7 @@ slopguard rules                   # list all rules
 | duplicate-function | error | py | structurally identical function elsewhere (identifiers normalized — catches renamed rewrites) |
 | dead-code | error | py | unreachable statements after return/raise/break/continue |
 | syntax-error | error | py | file doesn't parse |
+| diverged-duplicate | warn | py | function 60%+ token-identical to another — a fork drifting apart (fixes landing on one side), or identical-except-literals code that wants parameterizing |
 | duplicate-code | warn | all | copy-pasted block (~6+ normalized lines) elsewhere in the file set |
 | unused-private | warn | py, ts, java, … | private function/method/field never referenced in its file |
 | write-only-attr | warn | py | `self._x` assigned but never read |

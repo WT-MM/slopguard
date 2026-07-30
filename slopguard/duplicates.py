@@ -1,12 +1,19 @@
 """Duplicate-code detection.
 
-Two passes:
+Three passes:
 1. Language-agnostic: hash sliding windows of normalized lines across all
    files; catches copy-paste blocks (the dominant agent failure mode).
 2. Python-only: structural function comparison with identifiers normalized;
    catches "wrote the same helper again with different names".
+3. Python-only: NEAR-duplicate functions via token-shingle Jaccard;
+   catches diverged copies — forks where fixes landed on one side only,
+   which exact matching is structurally blind to.
 """
 import ast
+import hashlib
+import io
+import textwrap
+import tokenize
 
 from .findings import Finding
 
@@ -188,3 +195,131 @@ def find_duplicate_functions(py_files):
                 "%s() is structurally identical to %s() at %s:%d — reuse it instead"
                 % (name, first[2], first[0], first[1])))
     return findings
+
+
+# ------------------------------------------------------------- near-duplicates
+
+DIVERGED_LOW = 0.60    # below this, similarity is coincidence
+DIVERGED_PARAM = 0.98  # at/above this the code is identical except literals
+DIVERGED_MIN_SHINGLES = 40  # substantial functions only
+_SHINGLE_W = 5
+_MAX_SHINGLE_DF = 20   # shingles in >20 functions are boilerplate, not identity
+_AGGREGATE_AT = 5      # this many pairs across one file pair = report the fork
+_MAX_NEARDUP_FUNCTIONS = 10000
+
+
+def _token_shingles(src):
+    """Shingle-hash set over the function's tokens; literals normalized so
+    edited constants don't mask sameness, identifiers kept so coincidentally
+    shaped code doesn't fake it."""
+    toks = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(textwrap.dedent(src)).readline):
+            if tok.type in (tokenize.NAME, tokenize.OP):
+                toks.append(tok.string)
+            elif tok.type == tokenize.NUMBER:
+                toks.append("0")
+            elif tok.type == tokenize.STRING:
+                toks.append("s")
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return frozenset()
+    shingles = set()
+    for i in range(len(toks) - _SHINGLE_W + 1):
+        digest = hashlib.blake2b(
+            "\x00".join(toks[i:i + _SHINGLE_W]).encode(), digest_size=8).digest()
+        shingles.add(int.from_bytes(digest, "big"))
+    return frozenset(shingles)
+
+
+def _function_entries(py_files):
+    """[(path, name, lineno, end_lineno, shingles, shape_digest)] for
+    substantial functions. shape_digest identifies structural duplicates so
+    pairs owned by find_duplicate_functions aren't double-reported."""
+    entries = []
+    for path, text in sorted(py_files.items()):
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        lines = text.splitlines(keepends=True)
+        functions = [node for node in ast.walk(tree)
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        # _shape mutates nodes in place (renames the whole subtree), so
+        # capture every function's identity before shaping any of them.
+        names = {id(node): node.name for node in functions}
+        for node in functions:
+            end = getattr(node, "end_lineno", node.lineno)
+            shingles = _token_shingles("".join(lines[node.lineno - 1:end]))
+            if len(shingles) < DIVERGED_MIN_SHINGLES:
+                continue
+            shape = hashlib.blake2b(
+                _shape(node).encode(), digest_size=8).digest()
+            entries.append((path, names[id(node)], node.lineno, end, shingles, shape))
+            if len(entries) >= _MAX_NEARDUP_FUNCTIONS:
+                return entries
+    return entries
+
+
+def _nested(a, b):
+    return a[0] == b[0] and (
+        (a[2] <= b[2] and b[3] <= a[3]) or (b[2] <= a[2] and a[3] <= b[3]))
+
+
+def _candidate_pairs(entries):
+    index = {}
+    for i, entry in enumerate(entries):
+        for h in entry[4]:
+            index.setdefault(h, []).append(i)
+    counts = {}
+    for ids in index.values():
+        if len(ids) < 2 or len(ids) > _MAX_SHINGLE_DF:
+            continue
+        for a in range(len(ids)):
+            for b in range(a + 1, len(ids)):
+                key = (ids[a], ids[b])
+                counts[key] = counts.get(key, 0) + 1
+    for (ia, ib), common in counts.items():
+        smaller = min(len(entries[ia][4]), len(entries[ib][4]))
+        if common >= DIVERGED_LOW * smaller * 0.75:  # cheap bound before exact
+            yield ia, ib
+
+
+def find_diverged_duplicates(py_files):
+    """Near-duplicate function pairs: diverged copies that exact matching misses."""
+    entries = _function_entries(py_files)
+    pairs = []
+    for ia, ib in _candidate_pairs(entries):
+        A, B = entries[ia], entries[ib]
+        if _nested(A, B) or A[5] == B[5]:
+            continue  # structural duplicates belong to find_duplicate_functions
+        jaccard = len(A[4] & B[4]) / len(A[4] | B[4])
+        if jaccard >= DIVERGED_LOW:
+            pairs.append((jaccard, A, B))
+
+    by_file_pair = {}
+    for jaccard, A, B in pairs:
+        by_file_pair.setdefault((A[0], B[0]), []).append((jaccard, A, B))
+
+    findings = []
+    for (file_a, file_b), group in sorted(by_file_pair.items()):
+        group.sort(key=lambda p: -p[0])
+        if len(group) >= _AGGREGATE_AT:
+            avg = sum(p[0] for p in group) / len(group)
+            names = ", ".join(p[2][1] for p in group[:4])
+            findings.append(Finding(
+                "diverged-duplicate", "warn", file_b, group[0][2][2],
+                "%d functions here (%s, …) are ~%d%% identical to counterparts in %s "
+                "— a diverged fork: fixes land on one side and silently miss the other"
+                % (len(group), names, avg * 100, file_a)))
+            continue
+        for jaccard, A, B in group:
+            if jaccard >= DIVERGED_PARAM:
+                message = ("%s() is identical to %s() at %s:%d except for literal "
+                           "values — parameterize one function instead of copying"
+                           % (B[1], A[1], A[0], A[2]))
+            else:
+                message = ("%s() is ~%d%% identical to %s() at %s:%d — diverged copy? "
+                           "unify them or document why the fork is intentional"
+                           % (B[1], jaccard * 100, A[1], A[0], A[2]))
+            findings.append(Finding("diverged-duplicate", "warn", B[0], B[2], message))
+    return findings[:MAX_REPORTS]
