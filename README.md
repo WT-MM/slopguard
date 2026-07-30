@@ -9,14 +9,24 @@ Designed to run as a **hook inside AI coding agents** (Claude Code and OpenAI
 Codex CLI), so the agent gets blocking feedback the moment it writes slop and
 fixes it itself — no human review pass needed. Zero dependencies, Python ≥ 3.9.
 
+## Install
+
+```bash
+pip install git+https://github.com/WT-MM/slopguard   # or `pip install .` from a checkout
+slopguard install claude    # wire PostToolUse hook into ~/.claude/settings.json
+slopguard install codex     # append hooks to ~/.codex/config.toml
+```
+
+Zero dependencies; running straight from a checkout via `bin/slopguard` works
+too (the installers prefer a pip-installed console script when one is on
+PATH, else they pin the checkout's launcher path).
+
 ## Usage
 
 ```bash
-bin/slopguard scan <paths>            # human-readable report, exit 1 on warn+
-bin/slopguard scan --json --fail-on never
-bin/slopguard rules                   # list all rules
-bin/slopguard install claude          # wire PostToolUse hook into ~/.claude/settings.json
-bin/slopguard install codex           # append hooks to ~/.codex/config.toml
+slopguard scan <paths>            # human-readable report, exit 1 on warn+
+slopguard scan --json --fail-on never
+slopguard rules                   # list all rules
 ```
 
 ## Rules

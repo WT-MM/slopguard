@@ -251,15 +251,22 @@ def test_install_command_quoting():
     from slopguard import install
 
     original_file = install.__file__
+    original_which = install.shutil.which
     try:
         install.__file__ = os.path.join(
             os.sep, "tmp", "repo with space", "slopguard", "install.py")
+        install.shutil.which = lambda _name: None
         command = install.hook_command("codex")
+        install.shutil.which = lambda _name: "/opt/venv/bin/slopguard"
+        pip_command = install.hook_command("codex")
     finally:
         install.__file__ = original_file
+        install.shutil.which = original_which
     check("installed hook command quotes repository paths",
           shlex.split(command)[0] == "/tmp/repo with space/bin/slopguard",
           command)
+    check("pip-installed console script is preferred when on PATH",
+          shlex.split(pip_command)[0] == "/opt/venv/bin/slopguard", pip_command)
     block = install.CODEX_BLOCK.format(
         marker=install.MARKER, command=json.dumps(command))
     check("Codex installer TOML-escapes the hook command",

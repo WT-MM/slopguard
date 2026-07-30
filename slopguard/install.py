@@ -3,6 +3,7 @@ import contextlib
 import json
 import os
 import shlex
+import shutil
 import stat
 import sys
 import tempfile
@@ -13,9 +14,13 @@ MARKER = "slopguard hooks"
 
 
 def hook_command(agent):
-    bin_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "bin", "slopguard")
-    return "%s hook --agent %s" % (shlex.quote(bin_path), shlex.quote(agent))
+    # A pip-installed console script survives repo moves; fall back to the
+    # in-repo launcher for source checkouts.
+    exe = shutil.which("slopguard")
+    if not exe:
+        exe = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "bin", "slopguard")
+    return "%s hook --agent %s" % (shlex.quote(exe), shlex.quote(agent))
 
 
 def run_install(args):

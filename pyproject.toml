@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slopguard"
+version = "0.2.0"
+description = "Static checks for the failure modes of AI-generated code — runs standalone or as a blocking hook inside Claude Code and OpenAI Codex CLI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "wt-mm", email = "wesley.maa@gmail.com" }]
+keywords = [
+  "lint", "static-analysis", "code-quality", "ai", "llm",
+  "claude-code", "codex", "agent", "hooks",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/WT-MM/slopguard"
+Issues = "https://github.com/WT-MM/slopguard/issues"
+
+[project.scripts]
+slopguard = "slopguard.cli:main"
+
+[tool.setuptools]
+packages = ["slopguard"]

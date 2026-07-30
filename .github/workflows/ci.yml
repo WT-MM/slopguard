@@ -21,3 +21,9 @@ jobs:
         run: python tests/run_tests.py
       - name: Self-scan (slopguard must be slop-free)
         run: ./bin/slopguard scan slopguard/ bin/ tests/run_tests.py
+      - name: Package install smoke test
+        run: |
+          python -m venv /tmp/pkgtest
+          /tmp/pkgtest/bin/pip install --quiet .
+          /tmp/pkgtest/bin/slopguard --version
+          /tmp/pkgtest/bin/slopguard scan tests/fixtures/slop_example.py --fail-on never > /dev/null
