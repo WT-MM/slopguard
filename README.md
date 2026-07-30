@@ -1,7 +1,6 @@
 # slopguard
 
-An ironically slop-generated tool that holds static checks for the specific failure modes of AI-generated code — the stuff
-that's *correct but bad*, which type checkers and default linters wave through:
+An ironically self-slop-generated tool that holds static checks for specific failure modes of AI-generated code which type checkers and default linters wave through:
 duplicated helpers, fields added "just in case", placeholder bodies, swallowed
 exceptions, comments that restate the code.
 
