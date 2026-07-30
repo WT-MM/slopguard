@@ -3,7 +3,7 @@ import re
 
 import os
 
-from .comments import hedging_phrase, is_banner, redundancy
+from .comments import hedging_phrase, is_banner, looks_like_code, redundancy
 from .findings import Finding
 
 HASH_COMMENT_EXTS = {".rb", ".sh", ".bash", ".zsh", ".yaml", ".yml"}
@@ -134,6 +134,7 @@ _GO_DECL = re.compile(r"^(func|type|var|const)\b|^[A-Z]\w*[\s(]")
 
 def _comments(findings, path, lines, ext):
     marker = "#" if ext in HASH_COMMENT_EXTS else "//"
+    banner_lines = set()
 
     def next_code_line(after_idx):
         for j in range(after_idx, len(lines)):
@@ -156,8 +157,12 @@ def _comments(findings, path, lines, ext):
                 "hedging-comment", "warn", path, lineno,
                 "hedging comment (\"%s...\") — implement the real thing or file a TODO with a ticket" % phrase))
             continue
-        if is_banner(comment):
-            continue  # section dividers organize, they don't restate
+        if is_banner(comment) or looks_like_code(comment):
+            banner_lines.add(lineno)
+            continue  # dividers organize / commented-out code isn't prose
+        if lineno - 1 in banner_lines:
+            banner_lines.add(lineno)
+            continue  # the title line under a banner divider
         code = code_part.strip() or next_code_line(idx + 1)
         if not code:
             continue

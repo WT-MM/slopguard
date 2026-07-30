@@ -6,7 +6,7 @@ import re
 import sys
 import tokenize
 
-from .comments import hedging_phrase, is_banner, redundancy
+from .comments import hedging_phrase, is_banner, looks_like_code, redundancy
 from .findings import Finding
 
 _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -37,10 +37,10 @@ def check_python(path, text, cfg):
     findings = []
     nodes = list(ast.walk(tree))
     parents = _parent_map(nodes)
-    _mutable_defaults(findings, path, nodes)
+    _mutable_defaults(findings, path, nodes, text)
     _placeholder_bodies(findings, path, nodes, parents)
     _dead_code(findings, path, nodes)
-    _exception_handling(findings, path, nodes)
+    _exception_handling(findings, path, nodes, parents)
     _unused_imports(findings, path, tree, nodes, text)
     _unused_private(findings, path, tree, nodes)
     _write_only_attrs(findings, path, nodes)
@@ -83,9 +83,26 @@ def _decorator_names(fn):
     return names
 
 
-def _mutable_defaults(findings, path, nodes):
+def _annotated_with_call(annotation):
+    """Annotated[X, Query()]-style params: the framework owns the default."""
+    return (isinstance(annotation, ast.Subscript)
+            and isinstance(annotation.value, ast.Name)
+            and annotation.value.id == "Annotated"
+            and any(isinstance(n, ast.Call) for n in ast.walk(annotation)))
+
+
+def _mutable_defaults(findings, path, nodes, text):
+    lines = text.splitlines()
     for fn in (n for n in nodes if isinstance(n, _FUNC_NODES)):
-        for default in list(fn.args.defaults) + [d for d in fn.args.kw_defaults if d]:
+        params = list(fn.args.posonlyargs) + list(fn.args.args)
+        defaults = list(fn.args.defaults)
+        annotated = {id(d) for p, d in zip(params[len(params) - len(defaults):], defaults)
+                     if p.annotation is not None and _annotated_with_call(p.annotation)}
+        for default in defaults + [d for d in fn.args.kw_defaults if d]:
+            if id(default) in annotated:
+                continue
+            if 0 < default.lineno <= len(lines) and "noqa" in lines[default.lineno - 1]:
+                continue
             bad = isinstance(default, (ast.List, ast.Dict, ast.Set)) or (
                 isinstance(default, ast.Call) and isinstance(default.func, ast.Name)
                 and default.func.id in ("list", "dict", "set"))
@@ -111,7 +128,7 @@ def _placeholder_bodies(findings, path, nodes, parents):
         if isinstance(parent, ast.ClassDef):
             base_names = set()
             for b in parent.bases:
-                node = b
+                node = b.value if isinstance(b, ast.Subscript) else b
                 while isinstance(node, ast.Attribute):
                     base_names.add(node.attr)
                     node = node.value
@@ -129,6 +146,9 @@ def _placeholder_bodies(findings, path, nodes, parents):
             (isinstance(body[0].exc, ast.Name) and body[0].exc.id == "NotImplementedError") or
             (isinstance(body[0].exc, ast.Call) and isinstance(body[0].exc.func, ast.Name)
              and body[0].exc.func.id == "NotImplementedError"))
+        doc = ast.get_docstring(fn) or ""
+        if re.search(r"subclass|override|no-?op|does nothing|by default|hook", doc, re.I):
+            continue  # documented extension point, not an unimplemented stub
         if empty and not raises_not_impl:
             findings.append(Finding(
                 "placeholder-body", "warn", path, fn.lineno,
@@ -170,7 +190,18 @@ def _caught_names(handler):
     return names
 
 
-def _exception_handling(findings, path, nodes):
+def _in_loop(node, parents):
+    cursor = parents.get(node)
+    while cursor is not None:
+        if isinstance(cursor, (ast.For, ast.AsyncFor, ast.While)):
+            return True
+        if isinstance(cursor, _FUNC_NODES):
+            return False
+        cursor = parents.get(cursor)
+    return False
+
+
+def _exception_handling(findings, path, nodes, parents):
     for node in nodes:
         if not isinstance(node, ast.ExceptHandler):
             continue
@@ -183,6 +214,11 @@ def _exception_handling(findings, path, nodes):
         if node.type is not None and \
                 all(n in _CANCELLATION_NAMES for n in _caught_names(node)):
             continue
+        parent_try = next((t for t in nodes if isinstance(t, ast.Try) and node in t.handlers), None)
+        if node.type is not None and parent_try is not None and parent_try.body \
+                and isinstance(parent_try.body[-1], (ast.Return, ast.Break, ast.Continue)) \
+                and _in_loop(parent_try, parents):
+            continue  # try-next-candidate SEARCH LOOP: pass moves to the next attempt
         findings.append(Finding(
             "swallowed-exception", "warn", path, node.lineno,
             "exception silently swallowed (`except: pass`) — handle, log, re-raise, "
@@ -219,8 +255,9 @@ def _top_level_imports(nodes, text):
 
 
 def _unused_imports(findings, path, tree, nodes, text):
-    if path.endswith("__init__.py"):
-        return
+    base = os.path.basename(path)
+    if base == "__init__.py" or base in ("compat.py", "_compat.py"):
+        return  # re-export surfaces: imports exist for consumers, not this file
     imported = _top_level_imports(nodes, text)
     if not imported:
         return
@@ -270,13 +307,29 @@ def _unused_private(findings, path, tree, nodes):
             if _decorator_names(m):
                 continue  # properties / framework decorators register themselves
             if name not in attr_refs and name not in loads:
+                has_base = any(not (isinstance(b, ast.Name) and b.id == "object")
+                               for b in cls.bases)
                 findings.append(Finding(
-                    "unused-private", "warn", path, m.lineno,
-                    "private method `%s.%s` is never called in this file "
-                    "(if it's a framework hook, add a slopguard:ignore comment)" % (cls.name, name)))
+                    "unused-private", "info" if has_base else "warn", path, m.lineno,
+                    "private method `%s.%s` is never called in this file%s"
+                    % (cls.name, name,
+                       " (subclass: may implement a base-class template method)"
+                       if has_base else
+                       " (if it's a framework hook, add a slopguard:ignore comment)")))
 
 
 def _write_only_attrs(findings, path, nodes):
+    # Attrs on classes WITH bases may be consumed by the parent (stdlib
+    # CookieJar reads _cookies_lock; template methods read child state) —
+    # those demote to info.
+    inherited_spans = []
+    for cls in (n for n in nodes if isinstance(n, ast.ClassDef)):
+        if any(not (isinstance(b, ast.Name) and b.id == "object") for b in cls.bases):
+            inherited_spans.append((cls.lineno, getattr(cls, "end_lineno", cls.lineno)))
+
+    def in_subclass(lineno):
+        return any(lo <= lineno <= hi for lo, hi in inherited_spans)
+
     stores = {}  # attr -> first store lineno
     reads = set()
     for node in nodes:
@@ -291,7 +344,7 @@ def _write_only_attrs(findings, path, nodes):
     for attr, lineno in sorted(stores.items(), key=lambda kv: kv[1]):
         if attr.startswith("_") and not _is_dunder(attr) and attr not in reads:
             findings.append(Finding(
-                "write-only-attr", "warn", path, lineno,
+                "write-only-attr", "info" if in_subclass(lineno) else "warn", path, lineno,
                 "`self.%s` is assigned but never read in this file — state added \"just in case\"?" % attr))
 
 
@@ -300,7 +353,9 @@ def _size_and_nesting(findings, path, nodes, cfg):
     max_depth = cfg.get("max_nesting", 4)
     for fn in (n for n in nodes if isinstance(n, _FUNC_NODES)):
         end = getattr(fn, "end_lineno", fn.lineno)
-        span = end - fn.lineno + 1
+        body = _body_without_docstring(fn)
+        start = body[0].lineno if body else fn.lineno
+        span = end - start + 1  # signature and docstring are not complexity
         if span > max_lines:
             findings.append(Finding(
                 "long-function", "warn", path, fn.lineno,
@@ -379,6 +434,8 @@ def _comments(findings, path, text):
                 return stripped
         return None
 
+    banner_lines = set()
+
     for tok in tokens:
         if tok.type != tokenize.COMMENT:
             continue
@@ -396,8 +453,12 @@ def _comments(findings, path, text):
                 "hedging-comment", "warn", path, tok.start[0],
                 "hedging comment (\"%s...\") — implement the real thing or file a TODO with a ticket" % phrase))
             continue
-        if is_banner(comment):
-            continue  # section dividers organize, they don't restate
+        if is_banner(comment) or looks_like_code(comment):
+            banner_lines.add(tok.start[0])
+            continue  # dividers organize / commented-out code isn't prose
+        if tok.start[0] - 1 in banner_lines:
+            banner_lines.add(tok.start[0])
+            continue  # the title line under a banner divider
         code_part = lines[tok.start[0] - 1][:tok.start[1]].strip()
         code = code_part if code_part else next_code_line(tok.start[0])
         if not code:

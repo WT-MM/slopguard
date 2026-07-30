@@ -49,6 +49,16 @@ TEST_RELAXED_RULES = {"as-any", "ts-ignore", "duplicate-code", "debug-artifact",
                       "hand-rolled-contract", "contract-drift-key",
                       "placeholder-body", "write-only-attr", "hedging-comment"}
 _TEST_PATH_PARTS = ("/tests/", "/test/", "/__tests__/", "/spec/")
+# Pedagogical / intentionally-parallel code: tutorial variants, example apps,
+# per-language locale files, benchmark bodies. Real code duplicated here is
+# the POINT, so nothing blocks; findings stay visible at info.
+_PEDAGOGICAL_PATH_PARTS = ("/docs/", "/docs_src/", "/examples/", "/example/",
+                           "/locales/", "/locale/", "/benchmarks/", "/bench/")
+
+
+def is_pedagogical_path(path):
+    norm = path.replace(os.sep, "/")
+    return any(part in norm for part in _PEDAGOGICAL_PATH_PARTS)
 
 
 def is_test_file(path):
@@ -314,9 +324,12 @@ def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False,
         findings = [f for f in findings if f.file in report_files]
 
     # Patterns that are conventional in tests (mock casts, repeated setup
-    # blocks) drop to info there instead of blocking.
+    # blocks) drop to info there instead of blocking; pedagogical paths
+    # (docs examples, locales, benchmarks) never block at all.
     for f in findings:
         if f.severity == "warn" and f.rule in TEST_RELAXED_RULES and is_test_file(f.file):
+            f.severity = "info"
+        if f.severity in ("warn", "error") and is_pedagogical_path(f.file):
             f.severity = "info"
 
     disabled = set(cfg.get("disable", []))

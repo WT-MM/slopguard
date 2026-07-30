@@ -68,6 +68,14 @@ def is_banner(comment_text):
     return bool(_BANNER_RUN.search(comment_text))
 
 
+_CODEISH = re.compile(r"^[^A-Za-z\s]|[;{}]\s*$|=>|\)\s*;|::")
+
+
+def looks_like_code(comment_text):
+    """Commented-out code isn't a comment about code."""
+    return bool(_CODEISH.search(comment_text.strip()))
+
+
 def hedging_phrase(comment_text):
     low = comment_text.lower()
     for phrase in HEDGING_PHRASES:

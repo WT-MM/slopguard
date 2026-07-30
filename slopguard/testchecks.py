@@ -178,6 +178,17 @@ def _tautologies(findings, path, fn):
                 "assertion compares an expression to itself — always passes"))
 
 
+def _branch_asserts(stmts):
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Assert):
+                return True
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr.startswith("assert"):
+                return True
+    return False
+
+
 def _conditional_asserts(findings, path, fn):
     parents = {}
     for node in ast.walk(fn):
@@ -189,6 +200,9 @@ def _conditional_asserts(findings, path, fn):
         cursor = parents.get(node)
         while cursor is not None and cursor is not fn:
             if isinstance(cursor, ast.If):
+                if cursor.orelse and _branch_asserts(cursor.body) and _branch_asserts(cursor.orelse):
+                    cursor = parents.get(cursor)
+                    continue  # if/else where BOTH branches assert — never vacuous
                 findings.append(Finding(
                     "conditional-assert", "warn", path, node.lineno,
                     "assertion inside an `if` — the test only checks anything on some "
@@ -282,7 +296,13 @@ def _locally_bound_names(fn):
 
 def _sleeps(findings, path, fn, sleep_modules, sleep_functions):
     shadowed = _locally_bound_names(fn)
+    nested = set()
+    for inner in ast.walk(fn):
+        if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and inner is not fn:
+            nested.update(id(n) for n in ast.walk(inner))
     for node in ast.walk(fn):
+        if id(node) in nested:
+            continue  # sleep inside an injected callback IS the fixture behavior
         if not isinstance(node, ast.Call):
             continue
         f = node.func
@@ -390,7 +410,7 @@ def _parametrize_candidates(findings, path, tests, cfg):
 # ---------------------------------------------------------------- JS/TS side
 
 _BLOCK_START = re.compile(r"^[ \t]*(?:it|test)(\.\w+)?\s*\(\s*[`'\"]", re.M)
-_EXPECTISH = re.compile(r"\b\w*(?:expect|assert|check|verify|validate)\w*\s*\(", re.I)
+_EXPECTISH = re.compile(r"\b\w*(?:expect|assert|check|verify|validate)\w*\s*(?:<[^<>]*>)?\s*\(", re.I)
 _MOCK_CALL_ASSERT = re.compile(r"toHaveBeenCalled|toBeCalled|toHaveBeenNthCalled|toHaveBeenLastCalled")
 _TAUTOLOGY = re.compile(
     r"expect\(\s*(true|false|\d+|[`'\"][^`'\"]*[`'\"])\s*\)\s*\.\s*(?:toBe|toEqual|toStrictEqual)\(\s*\1\s*\)")
@@ -439,6 +459,8 @@ def check_generic_tests(path, text, cfg, ext):
                 "sleep-in-test", "warn", path, lineno + block.count("\n", 0, m.start()),
                 "real setTimeout wait in a test — use fake timers or poll a condition"))
         for m in _LONG_STR_EXPECT.finditer(block):
+            if block.count(m.group(1)) >= 2:
+                continue  # round-trip identity: the expected literal is also the input
             findings.append(Finding(
                 "brittle-exact-string", "warn", path, lineno + block.count("\n", 0, m.start()),
                 "equality against a %d-char string ties the test to incidental wording — "
