@@ -19,7 +19,6 @@ from .findings import Finding
 
 WINDOW = 6           # consecutive normalized lines per window
 MIN_BLOCK_CHARS = 120  # windows of trivial one-liners don't count
-MAX_REPORTS = 20
 _COMMENT_PREFIXES = ("#", "//", "/*", "*", "*/", "--")
 
 
@@ -74,8 +73,6 @@ def find_duplicate_blocks(files):
             "duplicate-code", "warn", pb, b_start,
             "~%d-line block duplicates %s:%d-%d — extract and reuse"
             % (a_end - a_start + 1, pa, a_start, a_end)))
-        if len(findings) >= MAX_REPORTS:
-            break
     return findings
 
 
@@ -137,12 +134,14 @@ class _Renamer(ast.NodeTransformer):
         return node
 
     def visit_FunctionDef(self, node):
+        decorators = [self.visit(d) for d in node.decorator_list]
+        node.decorator_list = []
         self.scopes.append(_bound_names(node))
         node.name = "x"
         node.returns = None
-        node.decorator_list = []
         node = self.generic_visit(node)
         self.scopes.pop()
+        node.decorator_list = decorators
         return node
 
     visit_AsyncFunctionDef = visit_FunctionDef
@@ -206,6 +205,19 @@ _SHINGLE_W = 5
 _MAX_SHINGLE_DF = 20   # shingles in >20 functions are boilerplate, not identity
 _AGGREGATE_AT = 5      # this many pairs across one file pair = report the fork
 _MAX_NEARDUP_FUNCTIONS = 10000
+_MAX_FULL_NAME_GROUP = 100
+_LARGE_NAME_NEIGHBORS = 20
+
+
+def _decorator_name(node):
+    while isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _decorator_name(node.value)
+        return ("%s.%s" % (base, node.attr)) if base else node.attr
+    return ""
 
 
 def _token_shingles(src):
@@ -213,9 +225,18 @@ def _token_shingles(src):
     edited constants don't mask sameness, identifiers kept so coincidentally
     shaped code doesn't fake it."""
     toks = []
+    fstring_depth = 0
     try:
         for tok in tokenize.generate_tokens(io.StringIO(textwrap.dedent(src)).readline):
-            if tok.type in (tokenize.NAME, tokenize.OP):
+            token_name = tokenize.tok_name.get(tok.type, "")
+            if token_name == "FSTRING_START":
+                if not fstring_depth:
+                    toks.append("s")
+                fstring_depth += 1
+            elif fstring_depth:
+                if token_name == "FSTRING_END":
+                    fstring_depth -= 1
+            elif tok.type in (tokenize.NAME, tokenize.OP):
                 toks.append(tok.string)
             elif tok.type == tokenize.NUMBER:
                 toks.append("0")
@@ -232,7 +253,7 @@ def _token_shingles(src):
 
 
 def _function_entries(py_files):
-    """[(path, name, lineno, end_lineno, shingles, shape_digest)] for
+    """[(path, name, lineno, end_lineno, shingles, shape_digest, decorators)] for
     substantial functions. shape_digest identifies structural duplicates so
     pairs owned by find_duplicate_functions aren't double-reported."""
     entries = []
@@ -248,13 +269,24 @@ def _function_entries(py_files):
         # capture every function's identity before shaping any of them.
         names = {id(node): node.name for node in functions}
         for node in functions:
+            name = names[id(node)]
+            if name.startswith("__") and name.endswith("__"):
+                continue
+            decorators = frozenset(
+                name for name in (_decorator_name(d) for d in node.decorator_list)
+                if name)
+            if any(name.rsplit(".", 1)[-1] == "overload" for name in decorators):
+                continue
+            start = min(
+                [node.lineno] + [d.lineno for d in node.decorator_list])
             end = getattr(node, "end_lineno", node.lineno)
-            shingles = _token_shingles("".join(lines[node.lineno - 1:end]))
+            shingles = _token_shingles("".join(lines[start - 1:end]))
             if len(shingles) < DIVERGED_MIN_SHINGLES:
                 continue
             shape = hashlib.blake2b(
                 _shape(node).encode(), digest_size=8).digest()
-            entries.append((path, names[id(node)], node.lineno, end, shingles, shape))
+            entries.append(
+                (path, name, node.lineno, end, shingles, shape, decorators))
             if len(entries) >= _MAX_NEARDUP_FUNCTIONS:
                 return entries
     return entries
@@ -271,39 +303,165 @@ def _candidate_pairs(entries):
         for h in entry[4]:
             index.setdefault(h, []).append(i)
     counts = {}
+    indexed_sizes = [0] * len(entries)
     for ids in index.values():
         if len(ids) < 2 or len(ids) > _MAX_SHINGLE_DF:
             continue
+        for i in ids:
+            indexed_sizes[i] += 1
         for a in range(len(ids)):
             for b in range(a + 1, len(ids)):
                 key = (ids[a], ids[b])
                 counts[key] = counts.get(key, 0) + 1
+    candidates = set()
     for (ia, ib), common in counts.items():
-        smaller = min(len(entries[ia][4]), len(entries[ib][4]))
+        smaller = min(indexed_sizes[ia], indexed_sizes[ib])
         if common >= DIVERGED_LOW * smaller * 0.75:  # cheap bound before exact
-            yield ia, ib
+            candidates.add((ia, ib))
+
+    # A copied family can push every shared shingle over the DF cap. Function
+    # names are deliberately retained by this rule, so same-name functions
+    # provide a strong, bounded fallback candidate source.
+    by_name = {}
+    for i, entry in enumerate(entries):
+        by_name.setdefault(entry[1], []).append(i)
+    for ids in by_name.values():
+        ids.sort(key=lambda i: (len(entries[i][4]), entries[i][0], entries[i][2]))
+        reach = len(ids) if len(ids) <= _MAX_FULL_NAME_GROUP \
+            else _LARGE_NAME_NEIGHBORS + 1
+        for pos, ia in enumerate(ids):
+            for ib in ids[pos + 1:pos + reach]:
+                candidates.add((min(ia, ib), max(ia, ib)))
+    yield from sorted(candidates)
 
 
-def find_diverged_duplicates(py_files):
+def _property_twins(a, b):
+    if a[0] != b[0] or a[1] != b[1]:
+        return False
+    roles = {
+        name.rsplit(".", 1)[-1] for name in a[6] | b[6]
+    }
+    return bool(roles & {"property", "cached_property", "getter", "setter", "deleter"})
+
+
+def _one_to_one(group, same_file):
+    """Greedily retain the strongest non-conflicting counterpart pairs."""
+    selected = []
+    used_a = set()
+    used_b = set()
+    used_same_file = set()
+    for pair in group:
+        a_id = (pair[1][0], pair[1][2])
+        b_id = (pair[2][0], pair[2][2])
+        if same_file:
+            if a_id in used_same_file or b_id in used_same_file:
+                continue
+            used_same_file.update((a_id, b_id))
+        else:
+            if a_id in used_a or b_id in used_b:
+                continue
+            used_a.add(a_id)
+            used_b.add(b_id)
+        selected.append(pair)
+    return selected
+
+
+def _multi_file_families(pairs, report_files=None):
+    """Collapse connected near-duplicate families spanning 3+ files."""
+    parent = {}
+
+    def identity(entry):
+        return entry[0], entry[2]
+
+    def find(item):
+        parent.setdefault(item, item)
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(a, b):
+        a = find(a)
+        b = find(b)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+
+    entries = {}
+    for _jaccard, a, b in pairs:
+        a_id = identity(a)
+        b_id = identity(b)
+        entries[a_id] = a
+        entries[b_id] = b
+        union(a_id, b_id)
+
+    groups = {}
+    for item in entries:
+        groups.setdefault(find(item), set()).add(item)
+    family_roots = {
+        root for root, items in groups.items()
+        if len(items) >= 3 and len({entries[item][0] for item in items}) >= 3
+    }
+
+    findings = []
+    for root in sorted(family_roots):
+        items = sorted(groups[root])
+        members = [entries[item] for item in items]
+        edges = [
+            pair for pair in pairs
+            if find(identity(pair[1])) == root and find(identity(pair[2])) == root
+        ]
+        average = sum(pair[0] for pair in edges) / len(edges)
+        names = ", ".join(sorted({entry[1] for entry in members})[:4])
+        report_members = [
+            entry for entry in members
+            if report_files is not None and entry[0] in report_files
+        ]
+        target = report_members[-1] if report_members else members[-1]
+        if all(pair[0] >= DIVERGED_PARAM for pair in edges):
+            message = (
+                "%d functions (%s) across %d files are identical except for literal "
+                "values — consolidate and parameterize the shared implementation"
+                % (len(members), names, len({entry[0] for entry in members})))
+        else:
+            message = (
+                "%d functions (%s) across %d files form a ~%d%% near-duplicate "
+                "family — consolidate the fork so fixes cannot diverge"
+                % (len(members), names, len({entry[0] for entry in members}),
+                   average * 100))
+        findings.append(Finding(
+            "diverged-duplicate", "warn", target[0], target[2], message))
+
+    remaining = [
+        pair for pair in pairs
+        if find(identity(pair[1])) not in family_roots
+    ]
+    return findings, remaining
+
+
+def find_diverged_duplicates(py_files, report_files=None):
     """Near-duplicate function pairs: diverged copies that exact matching misses."""
     entries = _function_entries(py_files)
     pairs = []
     for ia, ib in _candidate_pairs(entries):
         A, B = entries[ia], entries[ib]
-        if _nested(A, B) or A[5] == B[5]:
+        if _nested(A, B) or _property_twins(A, B) or A[5] == B[5]:
             continue  # structural duplicates belong to find_duplicate_functions
         jaccard = len(A[4] & B[4]) / len(A[4] | B[4])
         if jaccard >= DIVERGED_LOW:
+            if report_files is not None \
+                    and A[0] in report_files and B[0] not in report_files:
+                A, B = B, A
             pairs.append((jaccard, A, B))
 
+    findings, pairs = _multi_file_families(pairs, report_files=report_files)
     by_file_pair = {}
     for jaccard, A, B in pairs:
         by_file_pair.setdefault((A[0], B[0]), []).append((jaccard, A, B))
 
-    findings = []
     for (file_a, file_b), group in sorted(by_file_pair.items()):
-        group.sort(key=lambda p: -p[0])
-        if len(group) >= _AGGREGATE_AT:
+        group.sort(key=lambda p: (-p[0], p[1][2], p[2][2], p[1][1], p[2][1]))
+        group = _one_to_one(group, file_a == file_b)
+        if file_a != file_b and len(group) >= _AGGREGATE_AT:
             avg = sum(p[0] for p in group) / len(group)
             names = ", ".join(p[2][1] for p in group[:4])
             findings.append(Finding(
@@ -322,4 +480,4 @@ def find_diverged_duplicates(py_files):
                            "unify them or document why the fork is intentional"
                            % (B[1], jaccard * 100, A[1], A[0], A[2]))
             findings.append(Finding("diverged-duplicate", "warn", B[0], B[2], message))
-    return findings[:MAX_REPORTS]
+    return findings

@@ -292,7 +292,8 @@ def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False):
     findings.extend(find_duplicate_functions(
         {p: t for p, t in texts.items() if p.endswith(PY_EXT)}))
     findings.extend(find_diverged_duplicates(
-        {p: t for p, t in texts.items() if p.endswith(PY_EXT)}))
+        {p: t for p, t in texts.items() if p.endswith(PY_EXT)},
+        report_files=report_files))
 
     if report_files is not None:
         findings = [f for f in findings if f.file in report_files]
@@ -305,7 +306,7 @@ def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False):
 
     disabled = set(cfg.get("disable", []))
     findings = [f for f in findings if f.rule not in disabled]
-    return suppress_ignored(findings, texts)
+    return sort_findings(suppress_ignored(findings, texts))
 
 
 def suppress_ignored(findings, texts):

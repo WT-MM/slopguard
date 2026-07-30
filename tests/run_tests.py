@@ -131,7 +131,7 @@ def test_skipped_placeholder():
         check("clean test file has no findings", r.returncode == 0 and not found,
               json.dumps(found)[:300])
 
-
+# slopguard:ignore diverged-duplicate - shared scan harness is intentional
 def test_clean_file():
     with tempfile.TemporaryDirectory() as td:
         clean = os.path.join(td, "clean.py")
@@ -720,6 +720,150 @@ def scale_all(values, logger):
               "duplicate-function" not in [f["rule"] for f in found])
 
 
+def _near_duplicate_source(tag, literal, isolate_names=False):
+    suffix = "_" + tag if isolate_names else ""
+    return '''\
+def sync_%s(client%s, values%s, logger%s):
+    results%s = []
+    failures%s = []
+    for value%s in values%s:
+        record%s = client%s.fetch_%s(value%s)
+        if record%s is None:
+            logger%s.warning("missing record")
+            failures%s.append(value%s)
+            continue
+        normalized%s = client%s.normalize(record%s)
+        if normalized%s.is_valid:
+            results%s.append(normalized%s.payload)
+        else:
+            failures%s.append(value%s)
+    threshold%s = %d
+    if len(failures%s) > threshold%s:
+        client%s.report_failures(failures%s)
+    return results%s, failures%s
+''' % (
+        tag, suffix, suffix, suffix, suffix, suffix, suffix, suffix, suffix,
+        suffix, tag if isolate_names else "record", suffix, suffix, suffix,
+        suffix, suffix, suffix, suffix, suffix, suffix, suffix, suffix, suffix,
+        suffix, suffix, literal, suffix, suffix, suffix, suffix, suffix, suffix)
+
+
+def test_diverged_candidate_recall_and_reporting():
+    from slopguard.duplicates import find_diverged_duplicates
+
+    family = {
+        "/tmp/family_%02d.py" % i: _near_duplicate_source("records", i)
+        for i in range(21)
+    }
+    findings = find_diverged_duplicates(family)
+    check("DF-capped shingles do not hide a 21-copy family",
+          len(findings) == 1 and "21 functions" in findings[0].message,
+          repr([f.message for f in findings[:2]]))
+
+    independent = {}
+    for i in range(21):
+        tag = "case%d" % i
+        independent["/tmp/a_%02d.py" % i] = _near_duplicate_source(
+            tag, 1, isolate_names=True)
+        independent["/tmp/b_%02d.py" % i] = _near_duplicate_source(
+            tag, 2, isolate_names=True)
+    findings = find_diverged_duplicates(independent)
+    check("near-duplicate reporting does not silently stop at 20",
+          len(findings) == 21, "count=%d" % len(findings))
+
+    same_file = "".join(
+        _near_duplicate_source("worker%d" % i, i) for i in range(6))
+    findings = find_diverged_duplicates({"/tmp/workers.py": same_file})
+    check("same-file pairs are not aggregated as a fork of their own file",
+          not any("functions here" in f.message for f in findings),
+          repr([f.message for f in findings]))
+
+    target = "/tmp/a_target.py"
+    context = "/tmp/z_context.py"
+    findings = find_diverged_duplicates(
+        {
+            target: _near_duplicate_source("edited", 1),
+            context: _near_duplicate_source("edited", 2),
+        },
+        report_files={target})
+    check("near-duplicate findings stay attached to the edited hook target",
+          len(findings) == 1 and findings[0].file == target,
+          repr([(f.file, f.message) for f in findings]))
+
+
+def test_diverged_token_and_decorator_guards():
+    from slopguard.duplicates import (
+        _function_entries, _token_shingles, find_diverged_duplicates,
+    )
+
+    first = '''\
+def render(left):
+    values = list(left)
+    values.sort()
+    cleaned = [value for value in values if value is not None]
+    total = sum(cleaned)
+    average = total / len(cleaned)
+    return f"left={left}: average={average}"
+'''
+    second = first.replace("left={left}", "right={right}")
+    check("f-string contents normalize consistently",
+          _token_shingles(first) == _token_shingles(second))
+
+    pipeline = "\n".join(
+        "        step_%d = transform(step_%d)" % (i, i - 1)
+        for i in range(1, 12))
+    properties = '''\
+class Status:
+    @property
+    def value(self):
+        step_0 = self.raw
+%s
+        return step_11
+
+    @value.setter
+    def value(self, new_value):
+        step_0 = self.raw
+%s
+        return step_11
+''' % (pipeline, pipeline)
+    entries = _function_entries({"properties.py": properties})
+    check("function shingles include decorator roles",
+          len(entries) == 2 and entries[0][6] != entries[1][6],
+          repr([(entry[1], entry[6]) for entry in entries]))
+    check("property getter/setter twins are not diverged copies",
+          not find_diverged_duplicates({"properties.py": properties}))
+
+    overloaded = '''\
+@overload
+def convert(value):
+    stage_0 = normalize(value)
+%s
+    return stage_11
+''' % pipeline.replace("        ", "    ")
+    check("typing overload declarations stay out of near-duplicate candidates",
+          not _function_entries({"overload.py": overloaded}))
+
+
+def test_parallel_scan_determinism():
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, ".slopguard.json"), "w") as fh:
+            fh.write("{}")
+        with open(os.path.join(td, "status.proto"), "w") as fh:
+            fh.write("message S { string parent_frame = 1; }\n")
+        for i in range(205):
+            with open(os.path.join(td, "module_%03d.py" % i), "w") as fh:
+                fh.write("import os\nvalue_%d = %d\n" % (i, i))
+
+        first = run(["scan", td, "--json", "--fail-on", "never"])
+        second = run(["scan", td, "--json", "--fail-on", "never"])
+        findings = json.loads(first.stdout)
+        check("parallel scan pickles config and schema message sets",
+              first.returncode == 0 and len(findings) == 205,
+              "rc=%d findings=%d" % (first.returncode, len(findings)))
+        check("parallel scan output order is deterministic",
+              first.stdout == second.stdout)
+
+
 def test_rule_coverage():
     """Self-check: every rule slopguard documents must demonstrably fire."""
     from slopguard.cli import RULES
@@ -925,7 +1069,9 @@ def main():
                test_contract_block_parsers, test_contract_canon_and_yaml,
                test_config_schema_files,
                test_contract_false_positive_guards, test_schema_discovery_caps,
-               test_diverged_duplicates,
+               test_diverged_duplicates, test_diverged_candidate_recall_and_reporting,
+               test_diverged_token_and_decorator_guards,
+               test_parallel_scan_determinism,
                test_property_suggestion,
                test_rule_coverage, test_clean_file,
                test_clean_test_file, test_suppression, test_duplicate_function_bindings,
