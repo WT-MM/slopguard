@@ -13,8 +13,9 @@ import subprocess
 import sys
 from fnmatch import fnmatch
 
-from .cli import (analyze, collect_schema_files, config_schema_files,
-                  is_checkable, load_config, read_texts)
+from .cli import (analyze, apply_baseline, collect_schema_files,
+                  config_schema_files, find_baseline, is_checkable,
+                  load_config, read_texts)
 from .findings import at_or_above, sort_findings
 
 MAX_TARGET_FILES = 40
@@ -66,7 +67,11 @@ def _run(args):
         targets, max_files=remaining,
         max_dirs=MAX_HOOK_SCHEMA_DIRS) if remaining else []
     schema_texts = read_texts(sorted(set(configured + nearby)))
-    findings = analyze(texts, cfg, report_files=set(targets), schema_texts=schema_texts)
+    baseline_path, baseline_fps = find_baseline(cwd)
+    root = os.path.dirname(baseline_path) if baseline_path else None
+    findings = analyze(texts, cfg, report_files=set(targets),
+                       schema_texts=schema_texts, fingerprint_root=root)
+    findings, _hidden = apply_baseline(findings, baseline_fps)
     blocking = at_or_above(findings, "warn")
     if not blocking:
         return 0

@@ -12,7 +12,7 @@ from . import __version__
 from .contracts import check_contracts, schema_messages
 from .duplicates import (find_diverged_duplicates, find_duplicate_blocks,
                          find_duplicate_functions)
-from .findings import at_or_above, counts, sort_findings
+from .findings import add_fingerprints, at_or_above, counts, sort_findings
 from .generic import HASH_COMMENT_EXTS, JS_EXTS, _split_comment, check_generic
 from .pychecks import check_python
 from .testchecks import check_generic_tests, check_python_tests
@@ -270,7 +270,8 @@ def _file_findings(item):
 PARALLEL_MIN_FILES = 200  # process pool amortizes only on sizable scans
 
 
-def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False):
+def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False,
+            fingerprint_root=None):
     """texts: {path: content}. report_files limits which files findings are
     reported FOR; all files still provide duplicate-detection context.
     schema_texts: {path: content} of schema files defining the repo's message
@@ -306,7 +307,53 @@ def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False):
 
     disabled = set(cfg.get("disable", []))
     findings = [f for f in findings if f.rule not in disabled]
-    return sort_findings(suppress_ignored(findings, texts))
+    findings = sort_findings(suppress_ignored(findings, texts))
+    root = fingerprint_root or cfg.get("_config_dir") or os.getcwd()
+    return add_fingerprints(findings, texts, root)
+
+
+BASELINE_NAME = ".slopguard-baseline.json"
+
+
+def find_baseline(start_dir):
+    """Walk up from start_dir; returns (baseline_path, fingerprint_set) or
+    (None, set()). The baseline file's directory is the fingerprint root."""
+    d = os.path.abspath(start_dir)
+    while True:
+        candidate = os.path.join(d, BASELINE_NAME)
+        if os.path.isfile(candidate):
+            try:
+                with open(candidate) as fh:
+                    data = json.load(fh)
+                return candidate, set(data.get("fingerprints", {}))
+            except (OSError, ValueError):
+                return candidate, set()
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None, set()
+        d = parent
+
+
+def apply_baseline(findings, baseline_fps):
+    """Ratchet: drop findings already in the baseline; new ones stay hot."""
+    if not baseline_fps:
+        return findings, 0
+    kept = [f for f in findings if f.fingerprint not in baseline_fps]
+    return kept, len(findings) - len(kept)
+
+
+def write_baseline(path, findings):
+    entries = {
+        f.fingerprint: {"rule": f.rule, "file": os.path.relpath(f.file, os.path.dirname(path)),
+                        "line": f.line}
+        for f in at_or_above(findings, "warn")
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"version": 1, "fingerprints": entries}, fh, indent=1, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+    return len(entries)
 
 
 def suppress_ignored(findings, texts):
@@ -379,14 +426,15 @@ def print_report(findings, out=sys.stdout):
               % (len(findings), c["error"], c["warn"], c["info"]))
 
 
-def cmd_scan(args):
-    cfg = load_config(args.paths[0] if args.paths else ".")
-    for rule in args.disable or []:
+def _scan_findings(args):
+    """Shared analysis for scan/baseline: (findings, cfg, baseline_path)."""
+    start = args.paths[0] if args.paths else "."
+    cfg = load_config(start)
+    for rule in getattr(args, "disable", None) or []:
         cfg.setdefault("disable", []).append(rule)
     files = collect_files(args.paths or ["."])
     if not files:
-        print("slopguard: no checkable files found", file=sys.stderr)
-        return 0
+        return None, cfg, None
     if len(files) > MAX_SCAN_FILES:
         print("slopguard: %d checkable files found — scanning only the first %d. "
               "Point slopguard at a narrower path for full coverage."
@@ -400,14 +448,55 @@ def cmd_scan(args):
     if remaining:
         schema_files.extend(collect_schema_files(schema_paths, max_files=remaining))
     schema_texts = read_texts(sorted(set(schema_files)))
-    findings = analyze(texts, cfg, schema_texts=schema_texts, parallel=True)
+
+    start_dir = start if os.path.isdir(start) else os.path.dirname(os.path.abspath(start))
+    baseline_path, baseline_fps = find_baseline(start_dir)
+    root = (os.path.dirname(baseline_path) if baseline_path
+            else cfg.get("_config_dir") or os.path.abspath(start_dir))
+    findings = analyze(texts, cfg, schema_texts=schema_texts, parallel=True,
+                       fingerprint_root=root)
+    return (findings, baseline_fps), cfg, baseline_path or os.path.join(root, BASELINE_NAME)
+
+
+def cmd_scan(args):
+    result, cfg, _ = _scan_findings(args)
+    if result is None:
+        print("slopguard: no checkable files found", file=sys.stderr)
+        return 0
+    findings, baseline_fps = result
+    if args.no_baseline:
+        baseline_fps = set()
+    findings, hidden = apply_baseline(findings, baseline_fps)
     if args.json:
         print(json.dumps([f.to_dict() for f in sort_findings(findings)], indent=2))
     else:
         print_report(findings)
+        if hidden:
+            print("(%d baselined finding(s) hidden — `slopguard scan --no-baseline` shows them)"
+                  % hidden)
     fail_on = args.fail_on or cfg.get("fail_on", "warn")
     if fail_on != "never" and at_or_above(findings, fail_on):
         return 1
+    return 0
+
+
+def cmd_baseline(args):
+    result, _cfg, baseline_path = _scan_findings(args)
+    if result is None:
+        print("slopguard: no checkable files found", file=sys.stderr)
+        return 1
+    findings, existing = result
+    if args.update:
+        current = {f.fingerprint for f in at_or_above(findings, "warn")}
+        findings = [f for f in findings if f.fingerprint in (existing & current)]
+        n = write_baseline(baseline_path, findings)
+        print("baseline updated: %d fingerprint(s) remain (fixed findings removed, "
+              "new ones stay hot) — %s" % (n, baseline_path))
+    else:
+        n = write_baseline(baseline_path, findings)
+        print("baseline written: %d warn+ finding(s) grandfathered — %s"
+              % (n, baseline_path))
+        print("new findings will still block; shrink the file with `slopguard baseline --update`")
     return 0
 
 
@@ -429,7 +518,17 @@ def main(argv=None):
     p_scan.add_argument("--json", action="store_true")
     p_scan.add_argument("--fail-on", choices=["error", "warn", "never"])
     p_scan.add_argument("--disable", action="append", metavar="RULE")
+    p_scan.add_argument("--no-baseline", action="store_true",
+                        help="report baselined (grandfathered) findings too")
     p_scan.set_defaults(func=cmd_scan)
+
+    p_base = sub.add_parser(
+        "baseline",
+        help="grandfather current warn+ findings so only NEW ones block (ratchet)")
+    p_base.add_argument("paths", nargs="*", default=["."])
+    p_base.add_argument("--update", action="store_true",
+                        help="shrink the baseline: drop fingerprints for findings now fixed")
+    p_base.set_defaults(func=cmd_baseline)
 
     p_hook = sub.add_parser("hook", help="run as a Claude Code / Codex hook (JSON on stdin)")
     p_hook.add_argument("--agent", choices=["claude", "codex"], default="claude")

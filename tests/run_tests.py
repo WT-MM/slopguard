@@ -864,6 +864,58 @@ def test_parallel_scan_determinism():
               first.stdout == second.stdout)
 
 
+def test_baseline_ratchet():
+    src_v1 = "import os\n\n\ndef f(x=[]):\n    return x\n"
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "mod.py")
+        with open(path, "w") as fh:
+            fh.write(src_v1)
+
+        r = run(["baseline", td])
+        check("baseline command writes the file",
+              r.returncode == 0 and os.path.isfile(os.path.join(td, ".slopguard-baseline.json")),
+              r.stdout[:200])
+
+        r = run(["scan", td])
+        check("baselined findings no longer fail the scan", r.returncode == 0,
+              r.stdout[:200])
+        r = run(["scan", td, "--no-baseline"])
+        check("--no-baseline shows them again", r.returncode == 1)
+
+        # A NEW finding must stay hot even with a baseline present — and it
+        # must survive line drift: insert lines ABOVE the old findings.
+        with open(path, "w") as fh:
+            fh.write("import json\n\n\n" + src_v1 + "\n\ndef g():\n    try:\n"
+                     "        return json.loads('{}')\n    except Exception:\n"
+                     "        pass\n")
+        r = run(["scan", td, "--json", "--fail-on", "never"])
+        hot = {f["rule"] for f in json.loads(r.stdout)}
+        check("new finding stays hot; drifted old ones stay baselined",
+              "swallowed-exception" in hot and "mutable-default" not in hot
+              and "unused-import" not in hot, str(hot))
+
+        event = json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Edit",
+                            "cwd": td, "tool_input": {"file_path": path}})
+        r = run(["hook"], stdin_data=event)
+        check("hook blocks only on the new finding",
+              r.returncode == 2 and "swallowed-exception" in r.stderr
+              and "mutable-default" not in r.stderr, r.stderr[:300])
+
+        # Fix the new finding, then ratchet-shrink: the baseline may only lose
+        # entries, and fixed grandfathered findings can't come back.
+        with open(path, "w") as fh:
+            fh.write("def f(x=[]):\n    return x\n")  # unused-import gone, mutable stays
+        r = run(["baseline", td, "--update"])
+        check("baseline --update shrinks", r.returncode == 0 and "remain" in r.stdout,
+              r.stdout[:200])
+        with open(path, "w") as fh:
+            fh.write("import os\n\n\ndef f(x=[]):\n    return x\n")  # reintroduce
+        r = run(["scan", td, "--json", "--fail-on", "never"])
+        hot = {f["rule"] for f in json.loads(r.stdout)}
+        check("a fixed-then-reintroduced finding is hot again (ratchet)",
+              "unused-import" in hot and "mutable-default" not in hot, str(hot))
+
+
 def test_rule_coverage():
     """Self-check: every rule slopguard documents must demonstrably fire."""
     from slopguard.cli import RULES
@@ -1069,7 +1121,7 @@ def main():
                test_contract_block_parsers, test_contract_canon_and_yaml,
                test_config_schema_files,
                test_contract_false_positive_guards, test_schema_discovery_caps,
-               test_diverged_duplicates, test_diverged_candidate_recall_and_reporting,
+               test_diverged_duplicates, test_baseline_ratchet, test_diverged_candidate_recall_and_reporting,
                test_diverged_token_and_decorator_guards,
                test_parallel_scan_determinism,
                test_property_suggestion,
