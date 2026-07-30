@@ -12,10 +12,12 @@ fixes it itself — no human review pass needed. Zero dependencies, Python ≥ 3
 ## Install
 
 ```bash
-pip install git+https://github.com/WT-MM/slopguard   # or `pip install .` from a checkout
+pip install slopguards      # PyPI name is plural; the command is `slopguard`
 slopguard install claude    # wire PostToolUse hook into ~/.claude/settings.json
 slopguard install codex     # append hooks to ~/.codex/config.toml
 ```
+
+(From a checkout: `pip install .` or `pip install git+https://github.com/WT-MM/slopguard`.)
 
 Zero dependencies; running straight from a checkout via `bin/slopguard` works
 too (the installers prefer a pip-installed console script when one is on

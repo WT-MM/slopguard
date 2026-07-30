@@ -1,0 +1,69 @@
+name: Publish Python Packages
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: "publish"
+  cancel-in-progress: true
+
+jobs:
+  build-source-dist:
+    name: Build Python package (source distribution)
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build source distribution
+        run: |
+          uv build --sdist --out-dir dist
+
+      - name: Guard against private data in the sdist
+        run: |
+          tar -tzf dist/*.tar.gz | tee /tmp/sdist-contents
+          if grep -E "tools/precision|queue.jsonl|labels.jsonl" /tmp/sdist-contents; then
+            echo "sdist contains labeling-corpus data — refusing to publish" >&2
+            exit 1
+          fi
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-dist
+          path: |
+            dist/*.tar.gz
+
+  publish:
+    needs: [build-source-dist]
+    name: Publish Python package
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Move artifacts to dist directory
+        run: |
+          mkdir -p final_dist
+          find dist -name "*.whl" -exec mv {} final_dist/ \;
+          find dist -name "*.tar.gz" -exec mv {} final_dist/ \;
+
+      - name: Publish package
+        run: |
+          uv publish final_dist/*

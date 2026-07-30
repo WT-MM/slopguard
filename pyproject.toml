@@ -3,8 +3,10 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "slopguard"
-version = "0.2.0"
+# Distribution name matches the registered PyPI trusted publisher; the import
+# package, console script, and all tokens remain `slopguard`.
+name = "slopguards"
+dynamic = ["version"]
 description = "Static checks for the failure modes of AI-generated code — runs standalone or as a blocking hook inside Claude Code and OpenAI Codex CLI"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -26,6 +28,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/WT-MM/slopguard"
+Repository = "https://github.com/WT-MM/slopguard"
 Issues = "https://github.com/WT-MM/slopguard/issues"
 
 [project.scripts]
@@ -33,3 +36,6 @@ slopguard = "slopguard.cli:main"
 
 [tool.setuptools]
 packages = ["slopguard"]
+
+[tool.setuptools.dynamic]
+version = { attr = "slopguard.__version__" }
