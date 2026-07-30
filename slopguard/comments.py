@@ -68,7 +68,17 @@ def is_banner(comment_text):
     return bool(_BANNER_RUN.search(comment_text))
 
 
-_CODEISH = re.compile(r"^[^A-Za-z\s]|[;{}]\s*$|=>|\)\s*;|::")
+_CODEISH = re.compile(
+    r"=>|[{}]\s*$|"
+    r"^(?:@|[\[\]{}]|:\s*[A-Za-z_$][\w$]*\s+extends\b)|"
+    r"^[\"'][^\"']+[\"']\s*:|"
+    r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\(|"
+    r"^[A-Za-z_$][\w$.\[\]]*\s*(?:=|\+=|-=)|"
+    r"^(?:class|const|def|elif|else|except|export|for|from|function|if|"
+    r"import|interface|let|private|protected|public|raise|return|try|type|"
+    r"var|while)\b|"
+    r"\b[A-Za-z_$][\w$]*::[A-Za-z_$][\w$]*\b"
+)
 
 
 def looks_like_code(comment_text):

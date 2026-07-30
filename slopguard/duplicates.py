@@ -162,7 +162,7 @@ def _shape(fn):
     return ast.dump(fn, annotate_fields=False)
 
 
-def find_duplicate_functions(py_files):
+def find_duplicate_functions(py_files, report_files=None):
     """py_files: {path: text}. Structural duplicates among Python functions."""
     index = {}  # shape -> [(path, lineno, name)]
     for path, text in py_files.items():
@@ -187,8 +187,15 @@ def find_duplicate_functions(py_files):
     for locs in index.values():
         if len(locs) < 2:
             continue
-        first = locs[0]
-        for path, lineno, name in locs[1:]:
+        locs.sort()
+        context = [loc for loc in locs
+                   if report_files is not None and loc[0] not in report_files]
+        first = context[0] if context else locs[0]
+        for path, lineno, name in locs:
+            if (path, lineno, name) == first:
+                continue
+            if report_files is not None and path not in report_files:
+                continue
             findings.append(Finding(
                 "duplicate-function", "error", path, lineno,
                 "%s() is structurally identical to %s() at %s:%d — reuse it instead"

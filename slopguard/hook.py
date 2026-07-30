@@ -70,8 +70,13 @@ def _run(args):
     baseline_path, baseline_fps = find_baseline(cwd)
     root = (os.path.dirname(baseline_path) if baseline_path
             else project_root(cwd, cfg))
+    # The AST/token function-clone passes dominate runtime on directories with
+    # many siblings. PostToolUse keeps the cheap line-clone pass and defers the
+    # expensive function passes to Stop, which runs once per agent turn.
+    function_duplicates = event_name.startswith("Stop") or not event_name
     findings = analyze(texts, cfg, report_files=set(targets),
-                       schema_texts=schema_texts, fingerprint_root=root)
+                       schema_texts=schema_texts, fingerprint_root=root,
+                       function_duplicates=function_duplicates)
     findings, _hidden = apply_baseline(findings, baseline_fps)
     blocking = at_or_above(findings, "warn")
     if not blocking:

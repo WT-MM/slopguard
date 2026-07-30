@@ -16,6 +16,13 @@ _SKIP_DECORATORS = {"skip", "skipif", "xfail"}
 # Null-object / test-double classes have no-op methods by design.
 _NOOP_CLASS_NAME = re.compile(r"noop|null|dummy|fake|mock|stub", re.I)
 _NOOP_FILE_NAME = re.compile(r"^(mock|fake|stub)s?_|_(mock|fake|stub)s?\.py$", re.I)
+_ANNOTATED_MODULES = {"typing", "typing_extensions"}
+_DEFAULT_OWNING_METADATA = {
+    "Body", "Cookie", "Depends", "File", "Form", "Header", "Path",
+    "Query", "Security",
+}
+_FRAMEWORK_MODULES = {"fastapi"}
+_MARKER_BASES = {"object", "Generic", "Protocol", "ABC", "ABCMeta"}
 
 
 def check_python(path, text, cfg):
@@ -43,8 +50,8 @@ def check_python(path, text, cfg):
     _exception_handling(findings, path, nodes, parents)
     _unused_imports(findings, path, tree, nodes, text)
     _unused_private(findings, path, tree, nodes)
-    _write_only_attrs(findings, path, nodes)
-    _size_and_nesting(findings, path, nodes, cfg)
+    _write_only_attrs(findings, path, nodes, parents)
+    _size_and_nesting(findings, path, nodes, parents, cfg)
     _single_method_classes(findings, path, nodes)
     _debug_prints(findings, path, nodes)
     _comments(findings, path, text)
@@ -83,23 +90,107 @@ def _decorator_names(fn):
     return names
 
 
-def _annotated_with_call(annotation):
-    """Annotated[X, Query()]-style params: the framework owns the default."""
-    return (isinstance(annotation, ast.Subscript)
-            and isinstance(annotation.value, ast.Name)
-            and annotation.value.id == "Annotated"
-            and any(isinstance(n, ast.Call) for n in ast.walk(annotation)))
+def _terminal_name(node):
+    node = node.value if isinstance(node, ast.Subscript) else node
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _has_runtime_base(cls):
+    return any(_terminal_name(base) not in _MARKER_BASES for base in cls.bases)
+
+
+def _annotation_context(nodes):
+    annotated_names = set()
+    annotated_modules = set()
+    metadata_names = set()
+    framework_modules = set()
+    for node in nodes:
+        if getattr(node, "col_offset", 0) != 0:
+            continue
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in _ANNOTATED_MODULES:
+                    annotated_modules.add(alias.asname or root)
+                if root in _FRAMEWORK_MODULES:
+                    framework_modules.add(alias.asname or root)
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if root in _ANNOTATED_MODULES and alias.name == "Annotated":
+                    annotated_names.add(local)
+                if root in _ANNOTATED_MODULES and alias.name == "*":
+                    annotated_names.add("Annotated")
+                if root in _FRAMEWORK_MODULES and alias.name in _DEFAULT_OWNING_METADATA:
+                    metadata_names.add(local)
+                if root in _FRAMEWORK_MODULES and alias.name == "*":
+                    metadata_names.update(_DEFAULT_OWNING_METADATA)
+
+    context = (annotated_names, annotated_modules, metadata_names, framework_modules)
+    aliases = set()
+    for node in nodes:
+        if getattr(node, "col_offset", 0) != 0:
+            continue
+        value = None
+        targets = []
+        if isinstance(node, ast.Assign):
+            value, targets = node.value, node.targets
+        elif isinstance(node, ast.AnnAssign):
+            value, targets = node.value, [node.target]
+        if value is not None and _annotated_with_framework_call(value, context, aliases):
+            aliases.update(t.id for t in targets if isinstance(t, ast.Name))
+    return context + (aliases,)
+
+
+def _annotated_with_framework_call(annotation, context, aliases=()):
+    """Whether metadata on Annotated tells a known framework to own defaults."""
+    annotated_names, annotated_modules, metadata_names, framework_modules = context
+    if isinstance(annotation, ast.Name) and annotation.id in aliases:
+        return True
+    if not isinstance(annotation, ast.Subscript):
+        return False
+    value = annotation.value
+    is_annotated = (
+        isinstance(value, ast.Name) and value.id in annotated_names
+    ) or (
+        isinstance(value, ast.Attribute) and value.attr == "Annotated"
+        and isinstance(value.value, ast.Name)
+        and value.value.id in annotated_modules
+    )
+    if not is_annotated:
+        return False
+    parts = annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) \
+        else [annotation.slice]
+    for metadata in parts[1:]:
+        for call in (n for n in ast.walk(metadata) if isinstance(n, ast.Call)):
+            if isinstance(call.func, ast.Name) and call.func.id in metadata_names:
+                return True
+            if isinstance(call.func, ast.Attribute) \
+                    and call.func.attr in _DEFAULT_OWNING_METADATA \
+                    and isinstance(call.func.value, ast.Name) \
+                    and call.func.value.id in framework_modules:
+                return True
+    return False
 
 
 def _mutable_defaults(findings, path, nodes, text):
     lines = text.splitlines()
+    annotation_context = _annotation_context(nodes)
     for fn in (n for n in nodes if isinstance(n, _FUNC_NODES)):
         params = list(fn.args.posonlyargs) + list(fn.args.args)
         defaults = list(fn.args.defaults)
-        annotated = {id(d) for p, d in zip(params[len(params) - len(defaults):], defaults)
-                     if p.annotation is not None and _annotated_with_call(p.annotation)}
-        for default in defaults + [d for d in fn.args.kw_defaults if d]:
-            if id(default) in annotated:
+        pairs = list(zip(params[len(params) - len(defaults):], defaults))
+        pairs.extend(
+            (param, default)
+            for param, default in zip(fn.args.kwonlyargs, fn.args.kw_defaults)
+            if default is not None
+        )
+        for param, default in pairs:
+            if param.annotation is not None and _annotated_with_framework_call(
+                    param.annotation, annotation_context[:4], annotation_context[4]):
                 continue
             if 0 < default.lineno <= len(lines) and "noqa" in lines[default.lineno - 1]:
                 continue
@@ -147,7 +238,7 @@ def _placeholder_bodies(findings, path, nodes, parents):
             (isinstance(body[0].exc, ast.Call) and isinstance(body[0].exc.func, ast.Name)
              and body[0].exc.func.id == "NotImplementedError"))
         doc = ast.get_docstring(fn) or ""
-        if re.search(r"subclass|override|no-?op|does nothing|by default|hook", doc, re.I):
+        if re.search(r"subclass|override|no-?op|does nothing|hook", doc, re.I):
             continue  # documented extension point, not an unimplemented stub
         if empty and not raises_not_impl:
             findings.append(Finding(
@@ -190,15 +281,15 @@ def _caught_names(handler):
     return names
 
 
-def _in_loop(node, parents):
+def _enclosing_loop(node, parents):
     cursor = parents.get(node)
     while cursor is not None:
         if isinstance(cursor, (ast.For, ast.AsyncFor, ast.While)):
-            return True
+            return cursor
         if isinstance(cursor, _FUNC_NODES):
-            return False
+            return None
         cursor = parents.get(cursor)
-    return False
+    return None
 
 
 def _exception_handling(findings, path, nodes, parents):
@@ -214,10 +305,11 @@ def _exception_handling(findings, path, nodes, parents):
         if node.type is not None and \
                 all(n in _CANCELLATION_NAMES for n in _caught_names(node)):
             continue
-        parent_try = next((t for t in nodes if isinstance(t, ast.Try) and node in t.handlers), None)
+        parent_try = parents.get(node)
+        loop = _enclosing_loop(parent_try, parents) if isinstance(parent_try, ast.Try) else None
         if node.type is not None and parent_try is not None and parent_try.body \
                 and isinstance(parent_try.body[-1], (ast.Return, ast.Break, ast.Continue)) \
-                and _in_loop(parent_try, parents):
+                and isinstance(loop, (ast.For, ast.AsyncFor)):
             continue  # try-next-candidate SEARCH LOOP: pass moves to the next attempt
         findings.append(Finding(
             "swallowed-exception", "warn", path, node.lineno,
@@ -256,8 +348,9 @@ def _top_level_imports(nodes, text):
 
 def _unused_imports(findings, path, tree, nodes, text):
     base = os.path.basename(path)
-    if base == "__init__.py" or base in ("compat.py", "_compat.py"):
-        return  # re-export surfaces: imports exist for consumers, not this file
+    if base == "__init__.py":
+        return
+    compat_surface = base in ("compat.py", "_compat.py")
     imported = _top_level_imports(nodes, text)
     if not imported:
         return
@@ -273,7 +366,7 @@ def _unused_imports(findings, path, tree, nodes, text):
     for name, lineno in imported:
         if name not in used and name not in exported:
             findings.append(Finding(
-                "unused-import", "warn", path, lineno,
+                "unused-import", "info" if compat_surface else "warn", path, lineno,
                 "`%s` is imported but never used" % name))
 
 
@@ -307,8 +400,7 @@ def _unused_private(findings, path, tree, nodes):
             if _decorator_names(m):
                 continue  # properties / framework decorators register themselves
             if name not in attr_refs and name not in loads:
-                has_base = any(not (isinstance(b, ast.Name) and b.id == "object")
-                               for b in cls.bases)
+                has_base = _has_runtime_base(cls)
                 findings.append(Finding(
                     "unused-private", "info" if has_base else "warn", path, m.lineno,
                     "private method `%s.%s` is never called in this file%s"
@@ -318,37 +410,43 @@ def _unused_private(findings, path, tree, nodes):
                        " (if it's a framework hook, add a slopguard:ignore comment)")))
 
 
-def _write_only_attrs(findings, path, nodes):
+def _write_only_attrs(findings, path, nodes, parents):
     # Attrs on classes WITH bases may be consumed by the parent (stdlib
     # CookieJar reads _cookies_lock; template methods read child state) —
     # those demote to info.
-    inherited_spans = []
-    for cls in (n for n in nodes if isinstance(n, ast.ClassDef)):
-        if any(not (isinstance(b, ast.Name) and b.id == "object") for b in cls.bases):
-            inherited_spans.append((cls.lineno, getattr(cls, "end_lineno", cls.lineno)))
+    def owning_class(node):
+        cursor = parents.get(node)
+        while cursor is not None:
+            if isinstance(cursor, ast.ClassDef):
+                return cursor
+            cursor = parents.get(cursor)
+        return None
 
-    def in_subclass(lineno):
-        return any(lo <= lineno <= hi for lo, hi in inherited_spans)
-
-    stores = {}  # attr -> first store lineno
+    stores = {}  # (class, attr) -> first store lineno
     reads = set()
     for node in nodes:
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
+            owner = owning_class(node)
+            if owner is None:
+                continue
+            key = (owner, node.attr)
             if isinstance(node.ctx, ast.Store):
-                stores.setdefault(node.attr, node.lineno)
+                stores.setdefault(key, node.lineno)
             else:
-                reads.add(node.attr)
+                reads.add(key)
         if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Attribute) \
                 and isinstance(node.target.value, ast.Name) and node.target.value.id == "self":
-            reads.add(node.target.attr)
-    for attr, lineno in sorted(stores.items(), key=lambda kv: kv[1]):
-        if attr.startswith("_") and not _is_dunder(attr) and attr not in reads:
+            owner = owning_class(node.target)
+            if owner is not None:
+                reads.add((owner, node.target.attr))
+    for (cls, attr), lineno in sorted(stores.items(), key=lambda kv: kv[1]):
+        if attr.startswith("_") and not _is_dunder(attr) and (cls, attr) not in reads:
             findings.append(Finding(
-                "write-only-attr", "info" if in_subclass(lineno) else "warn", path, lineno,
+                "write-only-attr", "info" if _has_runtime_base(cls) else "warn", path, lineno,
                 "`self.%s` is assigned but never read in this file — state added \"just in case\"?" % attr))
 
 
-def _size_and_nesting(findings, path, nodes, cfg):
+def _size_and_nesting(findings, path, nodes, parents, cfg):
     max_lines = cfg.get("max_function_lines", 80)
     max_depth = cfg.get("max_nesting", 4)
     for fn in (n for n in nodes if isinstance(n, _FUNC_NODES)):
@@ -356,6 +454,18 @@ def _size_and_nesting(findings, path, nodes, cfg):
         body = _body_without_docstring(fn)
         start = body[0].lineno if body else fn.lineno
         span = end - start + 1  # signature and docstring are not complexity
+        nested_scopes = []
+        for nested in (n for n in nodes if isinstance(n, _FUNC_NODES + (ast.ClassDef,))
+                       and n is not fn):
+            cursor = parents.get(nested)
+            while cursor is not None and not isinstance(cursor, _FUNC_NODES + (ast.ClassDef,)):
+                cursor = parents.get(cursor)
+            if cursor is fn:
+                nested_scopes.append(nested)
+        for nested in nested_scopes:
+            # A nested definition is one statement in this function. Its body
+            # belongs to the nested scope and gets measured independently.
+            span -= max(0, getattr(nested, "end_lineno", nested.lineno) - nested.lineno)
         if span > max_lines:
             findings.append(Finding(
                 "long-function", "warn", path, fn.lineno,

@@ -998,7 +998,7 @@ def test_baseline_ratchet():
               "unused-import" in hot and "mutable-default" not in hot, str(hot))
 
 
-def test_precision_fixes():
+def test_precision_fixes():  # slopguard:ignore long-function — grouped calibration corpus
     """Regressions for the harness-driven FP-class fixes (unanimous labels)."""
     with tempfile.TemporaryDirectory() as td:
         def scan_rules(name, content):
@@ -1155,6 +1155,278 @@ export async function stop(sub: { undeclare(): Promise<void> }) {
               len(drift) == 1 and "vanishedField" in drift[0], str(drift))
 
 
+def test_external_path_and_python_guards():
+    from slopguard.cli import analyze
+    from slopguard.pychecks import check_python
+
+    def py_rules(source):
+        return [(f.rule, f.severity, f.line) for f in check_python("sample.py", source, {})]
+
+    product = analyze({"/repo/docs/product.py": "import os\n"}, {},
+                      fingerprint_root="/repo")
+    tutorial = analyze({"/repo/docs_src/tutorial.py": "import os\n"}, {},
+                       fingerprint_root="/repo")
+    broken = analyze({"/repo/docs_src/broken.py": "def broken(:\n"}, {},
+                     fingerprint_root="/repo")
+    check("/docs product code is not blanket-demoted",
+          any(f.rule == "unused-import" and f.severity == "warn" for f in product))
+    check("unambiguous tutorial paths still demote heuristics",
+          any(f.rule == "unused-import" and f.severity == "info" for f in tutorial))
+    check("pedagogical paths do not hide syntax errors",
+          any(f.rule == "syntax-error" and f.severity == "error" for f in broken))
+
+    annotations = '''\
+from typing import Annotated
+from typing_extensions import Annotated as A
+from fastapi import Query as Q
+
+QueryList = A[list, Q()]
+
+def endpoint(items: QueryList = [], /, *, tags: Annotated[list, Q()] = []):
+    return items, tags
+
+def marker():
+    return "metadata only"
+
+def real_bug(items: Annotated[list, marker()] = []):
+    items.append(1)
+
+def Query():
+    return "not FastAPI metadata"
+
+def local_name_bug(items: Annotated[list, Query()] = []):
+    items.append(1)
+
+class fastapi:
+    @staticmethod
+    def Query():
+        return "not the imported framework module"
+
+def module_name_bug(items: Annotated[list, fastapi.Query()] = []):
+    items.append(1)
+
+def local_import():
+    from fastapi import Query as InnerQ
+
+def scoped_import_bug(items: Annotated[list, InnerQ()] = []):
+    items.append(1)
+'''
+    mutable = [f for f in py_rules(annotations) if f[0] == "mutable-default"]
+    check("Annotated aliases align defaults without trusting lookalikes or local imports",
+          len(mutable) == 4, repr(mutable))
+    compat = check_python("compat.py", "from urllib.parse import urlparse\n", {})
+    check("compat re-export candidates stay visible without blocking",
+          any(f.rule == "unused-import" and f.severity == "info" for f in compat),
+          repr([(f.rule, f.severity) for f in compat]))
+    placeholders = py_rules('''\
+def vague():
+    """By default, callers configure this before use."""
+    pass
+
+def extension_hook():
+    """Does nothing by default; subclasses may override this hook."""
+    pass
+''')
+    check("placeholder docs require an actual no-op or extension-point signal",
+          len([f for f in placeholders if f[0] == "placeholder-body"]) == 1,
+          repr(placeholders))
+
+def test_external_exception_guards():
+    from slopguard.pychecks import check_python
+
+    exceptions = '''\
+def search(items):
+    for item in items:
+        try:
+            return parse(item)
+        except ValueError:
+            pass
+
+def retry():
+    while True:
+        try:
+            work()
+            break
+        except ValueError:
+            pass
+
+for item in items:
+    def nested():
+        try:
+            return parse(item)
+        except ValueError:
+            pass
+'''
+    swallowed = [
+        (f.rule, f.severity, f.line)
+        for f in check_python("exceptions.py", exceptions, {})
+        if f.rule == "swallowed-exception"
+    ]
+    check("try-next exemption stops at functions and excludes while retries",
+          len(swallowed) == 2, repr(swallowed))
+
+
+def test_external_subclass_and_function_guards():
+    from slopguard.pychecks import check_python
+
+    source = '''\
+from typing import Generic, TypeVar
+T = TypeVar("T")
+
+class Box(Generic[T]):
+    def _dead(self):
+        return 1
+
+    def configure(self):
+        self._unused = 1
+
+class Parent:
+    pass
+
+class Child(Parent):
+    def _hook(self):
+        return 1
+
+    def configure(self):
+        self._owned = 1
+
+class First:
+    def configure(self):
+        self._shared = 1
+
+class Second:
+    def read(self):
+        return self._shared
+'''
+    found = check_python("classes.py", source, {})
+    by_rule = {(f.rule, f.severity, f.line) for f in found}
+    check("typing marker bases do not gut subclass diagnostics",
+          ("unused-private", "warn", 5) in by_rule
+          and ("write-only-attr", "warn", 9) in by_rule, repr(by_rule))
+    check("unknown runtime parents retain conservative info demotion",
+          ("unused-private", "info", 15) in by_rule
+          and ("write-only-attr", "info", 19) in by_rule, repr(by_rule))
+    check("write-only attributes are tracked per class",
+          ("write-only-attr", "warn", 23) in by_rule, repr(by_rule))
+
+    doc = "\n".join("        documentation line %d" % i for i in range(100))
+    compact = '''\
+@decorate(lambda value: value)
+def compact(
+    first,
+    second,
+):
+    """\
+%s
+    """
+    transform = lambda value: value + first
+    return transform(second)
+''' % doc
+    found = check_python("compact.py", compact, {})
+    check("decorators, signatures, docstrings, and lambdas do not inflate body length",
+          not any(f.rule == "long-function" for f in found),
+          repr([(f.rule, f.message) for f in found]))
+
+    nested = ["def outer():", "    if True:", "        def inner():"]
+    nested.extend("            value_%d = %d" % (i, i) for i in range(82))
+    nested.extend(["            return value_81", "        return inner", ""])
+    found = check_python("nested.py", "\n".join(nested), {})
+    messages = [f.message for f in found if f.rule == "long-function"]
+    check("nested definitions are measured independently without duplicate outer noise",
+          len(messages) == 1 and "inner()" in messages[0], repr(messages))
+
+
+def test_external_callback_sleep_guards():
+    from slopguard.testchecks import check_python_tests
+
+    source = '''\
+import time
+
+def test_callbacks(monkeypatch):
+    def patched_read():
+        time.sleep(0.01)
+        return b"data"
+
+    def synchronous_helper():
+        time.sleep(0.02)
+
+    monkeypatch.setattr("module.read", patched_read)
+    synchronous_helper()
+    assert patched_read
+'''
+    sleeps = [
+        f for f in check_python_tests("test_callbacks.py", source, {})
+        if f.rule == "sleep-in-test"
+    ]
+    check("only genuinely passed callbacks exempt nested sleeps",
+          len(sleeps) == 1 and sleeps[0].line == 9,
+          repr([(f.line, f.message) for f in sleeps]))
+
+
+def test_external_generic_guards():
+    from slopguard.comments import looks_like_code
+    from slopguard.testchecks import check_generic_tests
+
+    literal = "a deliberately long diagnostic message whose exact prose is incidental"
+    round_trip = '''\
+test("round trip", () => {
+  expect(parse("%s")).toBe("%s");
+});
+''' % (literal, literal)
+    repeated_elsewhere = '''\
+test("message", () => {
+  const copy = "%s";
+  expect(getError()).toBe("%s");
+});
+''' % (literal, literal)
+    message_only = '''\
+test("assertion message", () => {
+  expect(getError(), "%s").toBe("%s");
+});
+''' % (literal, literal)
+    comment_only = '''\
+test("comment is not input", () => {
+  expect(getError(/* "%s" */)).toBe("%s");
+});
+''' % (literal, literal)
+    nested_type = '''\
+test("nested type", () => {
+  const marker = 1;
+  expectTypeOf<Record<string, Array<number>>>().toEqualTypeOf<Record<string, Array<number>>>();
+  void marker;
+});
+'''
+    comparison_only = '''\
+test("comparison only", () => {
+  const unexpected = 1;
+  const threshold = 2;
+  return unexpected < threshold;
+});
+'''
+    round_rules = check_generic_tests("round.test.ts", round_trip, {}, ".ts")
+    repeated_rules = check_generic_tests("message.test.ts", repeated_elsewhere, {}, ".ts")
+    message_rules = check_generic_tests("assertion-message.test.ts", message_only, {}, ".ts")
+    comment_rules = check_generic_tests("comment.test.ts", comment_only, {}, ".ts")
+    type_rules = check_generic_tests("type.test.ts", nested_type, {}, ".ts")
+    comparison_rules = check_generic_tests("comparison.test.ts", comparison_only, {}, ".ts")
+    check("round-trip exemption requires the literal in the expect subject",
+          not any(f.rule == "brittle-exact-string" for f in round_rules)
+          and any(f.rule == "brittle-exact-string" for f in repeated_rules)
+          and any(f.rule == "brittle-exact-string" for f in message_rules)
+          and any(f.rule == "brittle-exact-string" for f in comment_rules))
+    check("nested expectTypeOf generics count as assertions",
+          not any(f.rule == "no-assert-test" for f in type_rules)
+          and any(f.rule == "no-assert-test" for f in comparison_rules),
+          repr([(f.rule, f.line) for f in type_rules + comparison_rules]))
+    check("commented-code detection leaves numbered and parenthetical prose alone",
+          not looks_like_code("1. Parse the input")
+          and not looks_like_code("(Optional) retry on failure")
+          and not looks_like_code("Note:: this is important")
+          and not looks_like_code("This matters;")
+          and looks_like_code(": k extends string")
+          and looks_like_code("measurement.parse(1);"))
+
+
 def test_rule_coverage():
     """Self-check: every rule slopguard documents must demonstrably fire."""
     from slopguard.cli import RULES
@@ -1276,6 +1548,49 @@ def test_hook_path_with_spaces():
               "rc=%d %s" % (r.returncode, r.stderr[:200]))
 
 
+def test_hook_defers_function_duplicates():
+    with tempfile.TemporaryDirectory() as td:
+        subprocess.run(["git", "init", "-q", td], check=True, capture_output=True)
+        original = os.path.join(td, "original.py")
+        copied = os.path.join(td, "copied.py")
+        source = '''\
+def process(value):
+    first = validate(value)
+    second = transform(first)
+    third = persist(second)
+    notify(third)
+    return third
+'''
+        with open(original, "w") as fh:
+            fh.write(source)
+        subprocess.run(["git", "-C", td, "add", "original.py"],
+                       check=True, capture_output=True)
+        subprocess.run([
+            "git", "-C", td, "-c", "user.name=slopguard",
+            "-c", "user.email=slopguard@example.invalid",
+            "commit", "-qm", "initial",
+        ], check=True, capture_output=True)
+        with open(copied, "w") as fh:
+            fh.write(source.replace("process", "process_copy"))
+
+        r = run(["hook"], stdin_data=posttool_event(td, copied))
+        check("PostToolUse defers expensive function-clone passes",
+              "duplicate-function" not in r.stderr, r.stderr[:200])
+
+        subprocess.run(["git", "-C", td, "add", "copied.py"],
+                       check=True, capture_output=True)
+        event = json.dumps({
+            "hook_event_name": "Stop", "cwd": td,
+            "session_id": "test-stop-function-duplicates",
+        })
+        hook_env = os.environ.copy()
+        hook_env["SLOPGUARD_STATE_DIR"] = os.path.join(td, "state")
+        r = run(["hook"], stdin_data=event, env=hook_env)
+        check("Stop retains full function-clone analysis",
+              r.returncode == 2 and "duplicate-function" in r.stderr,
+              "rc=%d %s" % (r.returncode, r.stderr[:300]))
+
+
 def test_hook_exclude():
     with tempfile.TemporaryDirectory() as td:
         excluded_dir = os.path.join(td, "excluded")
@@ -1365,11 +1680,17 @@ def main():
                test_parallel_scan_determinism,
                test_fingerprint_identity, test_baseline_roots_and_partial_updates,
                test_property_suggestion,
+               test_external_path_and_python_guards,
+               test_external_exception_guards,
+               test_external_subclass_and_function_guards,
+               test_external_callback_sleep_guards,
+               test_external_generic_guards,
                test_rule_coverage, test_clean_file,
                test_clean_test_file, test_suppression, test_duplicate_function_bindings,
                test_install_command_quoting, test_atomic_installs,
                test_false_positive_guards,
-               test_hook_posttooluse, test_hook_path_with_spaces, test_hook_exclude,
+               test_hook_posttooluse, test_hook_path_with_spaces,
+               test_hook_defers_function_duplicates, test_hook_exclude,
                test_hook_stop_git, test_hook_stop_from_subdirectory,
                test_hook_garbage_stdin):
         fn()

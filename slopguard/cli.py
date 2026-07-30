@@ -49,16 +49,29 @@ TEST_RELAXED_RULES = {"as-any", "ts-ignore", "duplicate-code", "debug-artifact",
                       "hand-rolled-contract", "contract-drift-key",
                       "placeholder-body", "write-only-attr", "hedging-comment"}
 _TEST_PATH_PARTS = ("/tests/", "/test/", "/__tests__/", "/spec/")
-# Pedagogical / intentionally-parallel code: tutorial variants, example apps,
-# per-language locale files, benchmark bodies. Real code duplicated here is
-# the POINT, so nothing blocks; findings stay visible at info.
-_PEDAGOGICAL_PATH_PARTS = ("/docs/", "/docs_src/", "/examples/", "/example/",
+# Pedagogical / intentionally-parallel code: tutorial sources, example apps,
+# per-language locale files, benchmark bodies. `/docs/` is deliberately not
+# blanket-relaxed: some repositories ship their product from that directory.
+_PEDAGOGICAL_PATH_PARTS = ("/docs_src/", "/examples/", "/example/",
                            "/locales/", "/locale/", "/benchmarks/", "/bench/")
+_PEDAGOGICAL_BLOCKING_RULES = {"syntax-error", "dead-code"}
 
 
-def is_pedagogical_path(path):
+def is_pedagogical_path(path, cfg=None):
+    """Config can extend (`relaxed_paths`) or replace (`relaxed_paths_only`)
+    the default list, so the demotion policy is per-repo, not hardcoded."""
+    parts = _PEDAGOGICAL_PATH_PARTS
+    if cfg:
+        extra = cfg.get("relaxed_paths", [])
+        if isinstance(extra, str):
+            extra = [extra]
+        only = cfg.get("relaxed_paths_only")
+        if isinstance(only, list):
+            parts = tuple(only)
+        elif isinstance(extra, (list, tuple)):
+            parts = parts + tuple(extra)
     norm = path.replace(os.sep, "/")
-    return any(part in norm for part in _PEDAGOGICAL_PATH_PARTS)
+    return any(part in norm for part in parts)
 
 
 def is_test_file(path):
@@ -295,11 +308,12 @@ PARALLEL_MIN_FILES = 200  # process pool amortizes only on sizable scans
 
 
 def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False,
-            fingerprint_root=None):
+            fingerprint_root=None, function_duplicates=True):
     """texts: {path: content}. report_files limits which files findings are
     reported FOR; all files still provide duplicate-detection context.
     schema_texts: {path: content} of schema files defining the repo's message
-    contracts (kept out of texts so they aren't scanned as code)."""
+    contracts (kept out of texts so they aren't scanned as code).
+    function_duplicates=False retains only the cheap line-clone pass."""
     findings = []
     messages = schema_messages(schema_texts) if schema_texts else []
     items = [(path, text, cfg, messages) for path, text in texts.items()
@@ -314,22 +328,24 @@ def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False,
             findings.extend(_file_findings(item))
 
     findings.extend(find_duplicate_blocks(texts))
-    findings.extend(find_duplicate_functions(
-        {p: t for p, t in texts.items() if p.endswith(PY_EXT)}))
-    findings.extend(find_diverged_duplicates(
-        {p: t for p, t in texts.items() if p.endswith(PY_EXT)},
-        report_files=report_files))
+    if function_duplicates:
+        py_texts = {p: t for p, t in texts.items() if p.endswith(PY_EXT)}
+        findings.extend(find_duplicate_functions(
+            py_texts, report_files=report_files))
+        findings.extend(find_diverged_duplicates(
+            py_texts, report_files=report_files))
 
     if report_files is not None:
         findings = [f for f in findings if f.file in report_files]
 
     # Patterns that are conventional in tests (mock casts, repeated setup
-    # blocks) drop to info there instead of blocking; pedagogical paths
-    # (docs examples, locales, benchmarks) never block at all.
+    # blocks) drop to info there instead of blocking; structural heuristics in
+    # pedagogical paths (tutorial sources, locales, benchmarks) do likewise.
     for f in findings:
         if f.severity == "warn" and f.rule in TEST_RELAXED_RULES and is_test_file(f.file):
             f.severity = "info"
-        if f.severity in ("warn", "error") and is_pedagogical_path(f.file):
+        if f.severity in ("warn", "error") and is_pedagogical_path(f.file, cfg) \
+                and f.rule not in _PEDAGOGICAL_BLOCKING_RULES:
             f.severity = "info"
 
     disabled = set(cfg.get("disable", []))

@@ -294,11 +294,29 @@ def _locally_bound_names(fn):
     return names
 
 
+def _passed_callbacks(fn):
+    names = set()
+    lambdas = set()
+    for call in (n for n in ast.walk(fn) if isinstance(n, ast.Call)):
+        values = list(call.args) + [keyword.value for keyword in call.keywords]
+        for value in values:
+            for node in ast.walk(value):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    names.add(node.id)
+                elif isinstance(node, ast.Lambda):
+                    lambdas.add(id(node))
+    return names, lambdas
+
+
 def _sleeps(findings, path, fn, sleep_modules, sleep_functions):
     shadowed = _locally_bound_names(fn)
     nested = set()
+    passed_callbacks, passed_lambdas = _passed_callbacks(fn)
     for inner in ast.walk(fn):
-        if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and inner is not fn:
+        is_passed_function = isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+            and inner.name in passed_callbacks
+        is_passed_lambda = isinstance(inner, ast.Lambda) and id(inner) in passed_lambdas
+        if inner is not fn and (is_passed_function or is_passed_lambda):
             nested.update(id(n) for n in ast.walk(inner))
     for node in ast.walk(fn):
         if id(node) in nested:
@@ -410,13 +428,88 @@ def _parametrize_candidates(findings, path, tests, cfg):
 # ---------------------------------------------------------------- JS/TS side
 
 _BLOCK_START = re.compile(r"^[ \t]*(?:it|test)(\.\w+)?\s*\(\s*[`'\"]", re.M)
-_EXPECTISH = re.compile(r"\b\w*(?:expect|assert|check|verify|validate)\w*\s*(?:<[^<>]*>)?\s*\(", re.I)
+_EXPECTISH = re.compile(
+    r"\b(?:expect(?:TypeOf)?|assert\w*|check\w*|verify\w*|validate\w*)"
+    r"\s*(?:<|\()", re.I)
 _MOCK_CALL_ASSERT = re.compile(r"toHaveBeenCalled|toBeCalled|toHaveBeenNthCalled|toHaveBeenLastCalled")
 _TAUTOLOGY = re.compile(
     r"expect\(\s*(true|false|\d+|[`'\"][^`'\"]*[`'\"])\s*\)\s*\.\s*(?:toBe|toEqual|toStrictEqual)\(\s*\1\s*\)")
 _JS_SLEEP = re.compile(r"new\s+Promise\s*\([^;\n]*setTimeout")
 _LONG_STR_EXPECT = re.compile(r"\.\s*to(?:Be|Equal|StrictEqual|Contain)\(\s*[`'\"]([^`'\"]{%d,})" % LONG_STRING_ASSERT)
 _JS_MOCKS = re.compile(r"\b(?:jest|vi)\s*\.\s*(?:mock|spyOn|fn)\s*\(")
+
+
+def _js_string_literals(text):
+    """Yield raw JS string contents while ignoring comments."""
+    values = []
+    i = 0
+    while i < len(text):
+        if text.startswith("//", i):
+            newline = text.find("\n", i + 2)
+            i = len(text) if newline < 0 else newline + 1
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = len(text) if end < 0 else end + 2
+            continue
+        if text[i] not in "\"'`":
+            i += 1
+            continue
+        quote = text[i]
+        i += 1
+        value = []
+        while i < len(text):
+            if text[i] == "\\" and i + 1 < len(text):
+                value.extend(text[i:i + 2])
+                i += 2
+            elif text[i] == quote:
+                values.append("".join(value))
+                i += 1
+                break
+            else:
+                value.append(text[i])
+                i += 1
+    return values
+
+
+def _is_round_trip_expectation(block, match):
+    """The expected literal must occur inside this expect(...) subject.
+
+    Counting it anywhere in the test lets an unrelated variable or comment
+    disable brittle-exact-string.
+    """
+    prefix = block[:match.start()]
+    starts = list(re.finditer(r"\bexpect\s*\(", prefix))
+    if not starts:
+        return False
+    tail = prefix[starts[-1].end():]
+    depth = 0
+    quote = None
+    escaped = False
+    end = len(tail)
+    for i, char in enumerate(tail):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in "\"'`":
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            if depth == 0:
+                end = i
+                break
+            depth -= 1
+        elif char == "," and depth == 0:
+            end = i
+            break
+    subject = tail[:end]
+    return match.group(1) in _js_string_literals(subject)
 
 
 def check_generic_tests(path, text, cfg, ext):
@@ -459,7 +552,7 @@ def check_generic_tests(path, text, cfg, ext):
                 "sleep-in-test", "warn", path, lineno + block.count("\n", 0, m.start()),
                 "real setTimeout wait in a test — use fake timers or poll a condition"))
         for m in _LONG_STR_EXPECT.finditer(block):
-            if block.count(m.group(1)) >= 2:
+            if _is_round_trip_expectation(block, m):
                 continue  # round-trip identity: the expected literal is also the input
             findings.append(Finding(
                 "brittle-exact-string", "warn", path, lineno + block.count("\n", 0, m.start()),
