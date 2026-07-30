@@ -38,7 +38,7 @@ def check_generic(path, text, cfg, ext):
     code_lines = code.splitlines()
     _comments(findings, path, lines, ext)
     if ext in JS_EXTS or ext in {".java", ".cs", ".kt", ".swift", ".scala", ".c", ".cc", ".cpp", ".go"}:
-        _empty_catches(findings, path, code)
+        _empty_catches(findings, path, code, text)
     if ext in TS_EXTS:
         _type_escapes(findings, path, code_lines, lines)
     if ext in JS_EXTS:
@@ -174,15 +174,27 @@ def _comments(findings, path, lines, ext):
                 "comment mostly restates the code (\"%s\")" % comment[:60]))
 
 
-def _empty_catches(findings, path, text):
+def _empty_catches(findings, path, text, raw):
+    # Matching runs on the masked text (comments erased), so consult the raw
+    # span: a catch whose body is a comment is DOCUMENTED suppression — the
+    # JS/TS idiom for "deliberately ignored" (adjudicated: acceptable).
+    def documented(m):
+        return "//" in raw[m.start():m.end()] or "/*" in raw[m.start():m.end()]
+
     for m in _EMPTY_CATCH.finditer(text):
+        if documented(m):
+            continue
         findings.append(Finding(
             "swallowed-exception", "warn", path, _line_of_offset(text, m.start()),
-            "empty catch block silently swallows the error — handle, log, or rethrow"))
+            "empty catch block silently swallows the error — handle, log, rethrow, "
+            "or leave a comment in the block saying why ignoring is safe"))
     for m in _EMPTY_PROMISE_CATCH.finditer(text):
+        if documented(m):
+            continue
         findings.append(Finding(
             "swallowed-exception", "warn", path, _line_of_offset(text, m.start()),
-            "empty .catch() silently swallows the rejection — handle or log it"))
+            "empty .catch() silently swallows the rejection — handle, log, or leave "
+            "a comment in the block saying why ignoring is safe"))
 
 
 def _type_escapes(findings, path, code_lines, raw_lines):

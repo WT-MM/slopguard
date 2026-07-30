@@ -1115,6 +1115,26 @@ def test_refused_on_slew(replay_state):
               not any(r == "no-assert-test" for r, _s in helper), str(helper))
 
     with tempfile.TemporaryDirectory() as td:
+        doc = os.path.join(td, "cleanup.ts")
+        with open(doc, "w") as fh:
+            fh.write('''\
+export async function stop(sub: { undeclare(): Promise<void> }) {
+  try {
+    await sub.undeclare();
+  } catch {
+    // subscriber may already be gone (session closed) — safe to ignore
+  }
+  try {
+    await sub.undeclare();
+  } catch {}
+}
+''')
+        r = run(["scan", doc, "--json", "--fail-on", "never"])
+        catches = [f["line"] for f in json.loads(r.stdout) if f["rule"] == "swallowed-exception"]
+        check("documented catch exempt; bare catch still fires (adjudicated)",
+              catches == [9], str(catches))
+
+    with tempfile.TemporaryDirectory() as td:
         with open(os.path.join(td, "s.proto"), "w") as fh:
             fh.write('syntax = "proto3";\nmessage E {\n  string id = 1;\n  int32 support = 2;\n'
                      '  Aabb aabb = 3;\n  int32 obs_count = 4;\n  string derived_label = 5;\n'
