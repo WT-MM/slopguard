@@ -184,7 +184,7 @@ def _branch_asserts(stmts):
             if isinstance(node, ast.Assert):
                 return True
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                    and node.func.attr.startswith("assert"):
+                    and (node.func.attr.startswith("assert") or node.func.attr in _RAISES_NAMES):
                 return True
     return False
 
@@ -548,6 +548,9 @@ def check_generic_tests(path, text, cfg, ext):
                 "tautological-assert", "warn", path, lineno + block.count("\n", 0, m.start()),
                 "expect(x).toBe(x) — always passes, tests nothing"))
         for m in _JS_SLEEP.finditer(block):
+            tail = block[m.end():m.end() + 40]
+            if re.match(r"\s*\(\s*\w+\s*(?:,\s*0\s*)?\)", tail):
+                continue  # setTimeout(resolve) / (resolve, 0): microtask flush, not a wait
             findings.append(Finding(
                 "sleep-in-test", "warn", path, lineno + block.count("\n", 0, m.start()),
                 "real setTimeout wait in a test — use fake timers or poll a condition"))

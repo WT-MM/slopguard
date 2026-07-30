@@ -344,6 +344,11 @@ def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False,
     for f in findings:
         if f.severity == "warn" and f.rule in TEST_RELAXED_RULES and is_test_file(f.file):
             f.severity = "info"
+        # Per-variant test copies are a convention (fastapi tutorials, flask
+        # dual-handler tests); the fork risk they evidence is already caught
+        # by the src-side duplicate and diverged passes.
+        if f.rule == "duplicate-function" and is_test_file(f.file):
+            f.severity = "info"
         if f.severity in ("warn", "error") and is_pedagogical_path(f.file, cfg) \
                 and f.rule not in _PEDAGOGICAL_BLOCKING_RULES:
             f.severity = "info"

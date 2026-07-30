@@ -1427,6 +1427,93 @@ test("comparison only", () => {
           and looks_like_code("measurement.parse(1);"))
 
 
+def test_cycle4_fixes():
+    with tempfile.TemporaryDirectory() as td:
+        def rules_of(name, content):
+            p = os.path.join(td, name)
+            with open(p, "w") as fh:
+                fh.write(content)
+            r = run(["scan", p, "--json", "--fail-on", "never"])
+            return [(f["rule"], f["severity"]) for f in json.loads(r.stdout or "[]")]
+
+        jsdoc = rules_of("url.ts", '''\
+/**
+ * Merge paths.
+ * @example
+ * mergePath('/api', '/users') // '/api/users'
+ */
+export function mergePath(...paths: string[]): string {
+  return paths.join('');
+}
+''')
+        check("JSDoc @example annotations are not redundant comments",
+              not any(r == "redundant-comment" for r, _s in jsdoc), str(jsdoc))
+
+        eslint = rules_of("shim.ts", '''\
+export function grab(target: object, prop: string) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const documented = (target as any)[prop];
+  const bare = (target as any)[prop];
+  return [documented, bare];
+}
+''')
+        check("eslint-documented as-any exempt; bare one still fires",
+              [(r, s) for r, s in eslint if r == "as-any"] == [("as-any", "warn")], str(eslint))
+
+        flush = rules_of("flush.test.ts", '''\
+import { expect, it } from "vitest";
+it("flushes tasks", async () => {
+  await new Promise((r) => setTimeout(r));
+  await new Promise((r) => setTimeout(r, 0));
+  await new Promise((r) => setTimeout(r, 500));
+  expect(1).toBeGreaterThan(0);
+});
+''')
+        check("zero-delay setTimeout flushes exempt; real wait still fires",
+              sum(1 for r, _s in flush if r == "sleep-in-test") == 1, str(flush))
+
+        raises = rules_of("test_branches.py", '''\
+import pytest
+
+
+def test_mode_dependent(flag, client):
+    if flag:
+        with pytest.raises(ZeroDivisionError):
+            client.get("/")
+    else:
+        assert client.get("/").status_code == 500
+''')
+        check("raises-branch counts in the both-branch exemption",
+              not any(r == "conditional-assert" for r, _s in raises), str(raises))
+
+        proto = rules_of("proto_types.py", '''\
+import typing as t
+
+
+class ProxyMixin(t.Protocol):
+    def _get_current_object(self) -> object: ...
+''')
+        check("Protocol stub methods are not unused privates",
+              not any(r == "unused-private" for r, _s in proto), str(proto))
+
+        dup = os.path.join(td, "test_variants.py")
+        with open(dup, "w") as fh:
+            body = '''\
+def test_handler_%s(app, client):
+    called = []
+    app.mode = "same"
+    rv = client.get("/")
+    assert rv.status_code == 200
+    assert b"Response" in rv.data
+    assert len(called) == 0
+'''
+            fh.write(body % "plain" + "\n\n" + body % "debug")
+        r = run(["scan", dup, "--json", "--fail-on", "never"])
+        sev = [f["severity"] for f in json.loads(r.stdout) if f["rule"] == "duplicate-function"]
+        check("duplicate-function demotes to info in test files",
+              sev == ["info"], str(sev))
+
+
 def test_rule_coverage():
     """Self-check: every rule slopguard documents must demonstrably fire."""
     from slopguard.cli import RULES
@@ -1675,7 +1762,8 @@ def main():
                test_contract_block_parsers, test_contract_canon_and_yaml,
                test_config_schema_files,
                test_contract_false_positive_guards, test_schema_discovery_caps,
-               test_diverged_duplicates, test_baseline_ratchet, test_precision_fixes, test_diverged_candidate_recall_and_reporting,
+               test_diverged_duplicates, test_baseline_ratchet, test_precision_fixes,
+               test_cycle4_fixes, test_diverged_candidate_recall_and_reporting,
                test_diverged_token_and_decorator_guards,
                test_parallel_scan_determinism,
                test_fingerprint_identity, test_baseline_roots_and_partial_updates,

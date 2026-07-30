@@ -163,6 +163,8 @@ def _comments(findings, path, lines, ext):
         if lineno - 1 in banner_lines:
             banner_lines.add(lineno)
             continue  # the title line under a banner divider
+        if code_part.strip().startswith(("*", "/*")):
+            continue  # inside a JSDoc block: @example output annotations aren't comments-about-code
         code = code_part.strip() or next_code_line(idx + 1)
         if not code:
             continue
@@ -205,14 +207,21 @@ def _empty_catches(findings, path, text, raw):
 def _type_escapes(findings, path, code_lines, raw_lines):
     # `as any` is code, so match the masked text; @ts-ignore is a comment
     # DIRECTIVE, so it must be matched in the raw line the mask erased.
+    def eslint_documented(idx, marker):
+        for j in (idx - 1, idx):
+            if 0 <= j < len(raw_lines) and "eslint-disable" in raw_lines[j] and marker in raw_lines[j]:
+                return True
+        return False
+
     for idx, line in enumerate(code_lines):
-        if _AS_ANY.search(line):
+        if _AS_ANY.search(line) and not eslint_documented(idx, "no-explicit-any"):
             findings.append(Finding(
                 "as-any", "warn", path, idx + 1,
                 "`as any` defeats the type checker — type it properly"))
     for idx, line in enumerate(raw_lines):
         _, comment = _split_comment(line, "//")
-        if comment is not None and _TS_IGNORE.search(comment):
+        if comment is not None and _TS_IGNORE.search(comment) \
+                and not eslint_documented(idx, "ban-ts-comment"):
             findings.append(Finding(
                 "ts-ignore", "warn", path, idx + 1,
                 "@ts-ignore hides a type error — fix the type instead"))

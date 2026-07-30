@@ -391,6 +391,16 @@ def _unused_private(findings, path, tree, nodes):
                 ("class" if isinstance(node, ast.ClassDef) else "function", name)))
 
     for cls in (n for n in nodes if isinstance(n, ast.ClassDef)):
+        cls_bases = set()
+        for b in cls.bases:
+            node = b.value if isinstance(b, ast.Subscript) else b
+            while isinstance(node, ast.Attribute):
+                cls_bases.add(node.attr)
+                node = node.value
+            if isinstance(node, ast.Name):
+                cls_bases.add(node.id)
+        if cls_bases & {"Protocol", "ABC", "ABCMeta"}:
+            continue  # stub methods on protocols/ABCs are declarations, not code
         for m in cls.body:
             if not isinstance(m, _FUNC_NODES):
                 continue
