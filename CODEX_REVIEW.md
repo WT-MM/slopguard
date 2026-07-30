@@ -1,5 +1,15 @@
 # Codex cross-review
 
+> **Status (2026-07-30, round 6):** This document is the historical audit
+> trail of the Codex × Claude cross-review, rounds 1-2; verdicts below were
+> written then. Every `fixed-by-me` item and accepted proposal from rounds
+> 1-6 has landed. Still open, by design (roadmap items, not bugs):
+> tree-sitter parsers for non-Python ASTs, rename-aware fingerprint
+> identity, a directory-bounded glob walker for `contract_schemas`,
+> GraphQL `extend type` merging, and flow-style YAML `properties`.
+> Later rounds are recorded in commit messages and tools/precision/.
+
+
 I read the launcher, every module under `slopguard/`, the full test runner,
 all fixtures, and the README before editing. The original suite passed when
 allowed to write its user-cache loop state; the revised suite is isolated

@@ -33,14 +33,42 @@ def check_python_tests(path, text, cfg):
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError):
         return []
+    if _is_manual_harness(tree):
+        return []  # print-driven rig scripts aren't unit tests
     findings = []
     tests = _collect_test_functions(tree)
     sleep_modules, sleep_functions = _sleep_symbols(tree)
+    assertful = _assertful_locals(tree)
     for fn in tests:
         _check_one_test(
-            findings, path, fn, cfg, sleep_modules, sleep_functions)
+            findings, path, fn, cfg, sleep_modules, sleep_functions, assertful)
     _parametrize_candidates(findings, path, tests, cfg)
     return findings
+
+
+def _is_manual_harness(tree):
+    """A test-named file with a __main__ entrypoint is a hand-run diagnostic
+    script (rig/hardware harness), not a unit-test suite."""
+    for node in tree.body:
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Compare) \
+                and isinstance(node.test.left, ast.Name) \
+                and node.test.left.id == "__name__":
+            return True
+    return False
+
+
+def _assertful_locals(tree):
+    """Names of module-local functions that assert internally — calling one
+    counts as asserting (domain assert-helpers like _play_refused)."""
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name.startswith("test"):
+            continue
+        if any(isinstance(inner, ast.Assert) for inner in ast.walk(node)):
+            names.add(node.name)
+    return names
 
 
 def _collect_test_functions(tree):
@@ -56,7 +84,7 @@ def _collect_test_functions(tree):
     return tests
 
 
-def _classify_assertions(fn):
+def _classify_assertions(fn, assertful=frozenset()):
     """Returns [(node, kind)] with kind in plain|mock|raises|helper."""
     out = []
     for node in ast.walk(fn):
@@ -73,7 +101,7 @@ def _classify_assertions(fn):
                     out.append((node, "plain"))
             elif isinstance(f, ast.Name):
                 low = f.id.lower()
-                if any(h in low for h in _ASSERT_HELPER_HINTS):
+                if f.id in assertful or any(h in low for h in _ASSERT_HELPER_HINTS):
                     out.append((node, "helper"))
     return out
 
@@ -89,18 +117,22 @@ def _is_placeholder(fn):
                for s in body)
 
 
-def _check_one_test(findings, path, fn, cfg, sleep_modules, sleep_functions):
-    assertions = _classify_assertions(fn)
+def _check_one_test(findings, path, fn, cfg, sleep_modules, sleep_functions,
+                    assertful=frozenset()):
+    assertions = _classify_assertions(fn, assertful)
 
     if not assertions and not _is_placeholder(fn):
         findings.append(Finding(
             "no-assert-test", "warn", path, fn.lineno,
             "%s() never asserts anything — it only proves the code doesn't crash" % fn.name))
     elif assertions and all(kind == "mock" for _, kind in assertions):
+        # info, not warn: the harness measured 0% precision on driver-style
+        # tests where the mocked SDK IS the system boundary and call shape is
+        # the observable behavior. Stays visible in scans, never blocks.
         findings.append(Finding(
-            "mock-only-test", "warn", path, fn.lineno,
-            "%s() only asserts how collaborators were called — assert what the code "
-            "returned or changed instead; call-shape asserts break on refactor" % fn.name))
+            "mock-only-test", "info", path, fn.lineno,
+            "%s() only asserts how collaborators were called — if the mock is not a "
+            "hardware/SDK boundary, assert what the code returned or changed" % fn.name))
 
     _tautologies(findings, path, fn)
     _conditional_asserts(findings, path, fn)
@@ -395,9 +427,9 @@ def check_generic_tests(path, text, cfg, ext):
                 "test block never asserts anything — it only proves the code doesn't crash"))
         elif n_expect and len(_MOCK_CALL_ASSERT.findall(block)) >= n_expect:
             findings.append(Finding(
-                "mock-only-test", "warn", path, lineno,
-                "test only asserts how collaborators were called — assert what the code "
-                "returned or changed instead"))
+                "mock-only-test", "info", path, lineno,
+                "test only asserts how collaborators were called — if the mock is not a "
+                "hardware/SDK boundary, assert what the code returned or changed"))
         for m in _TAUTOLOGY.finditer(block):
             findings.append(Finding(
                 "tautological-assert", "warn", path, lineno + block.count("\n", 0, m.start()),

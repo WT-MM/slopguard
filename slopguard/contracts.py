@@ -316,13 +316,20 @@ def check_contracts(path, text, cfg, messages):
             k = key.value
             if _canon(k) not in canon:
                 # The incident class: a lowerCamel key whose field does NOT
-                # exist in the message its siblings all belong to.
-                if _LOWER_CAMEL_KEY.match(k):
-                    findings.append(Finding(
-                        "contract-drift-key", "warn", path, key.lineno,
-                        "key '%s' has no matching field in %s (its siblings are all "
-                        "schema-defined) — removed or renamed field still being emitted?"
-                        % (k, label)))
+                # exist in the message its siblings all belong to. But a key
+                # whose FIRST camel segment is itself a field (aabbMin for
+                # nested field `aabb`) is deliberate nested-field flattening,
+                # not drift — the harness measured this at 100% of drift FPs.
+                if not _LOWER_CAMEL_KEY.match(k):
+                    continue
+                first_segment = re.match(r"^[a-z0-9]+", k)
+                if first_segment and _canon(first_segment.group(0)) in canon:
+                    continue
+                findings.append(Finding(
+                    "contract-drift-key", "warn", path, key.lineno,
+                    "key '%s' has no matching field in %s (its siblings are all "
+                    "schema-defined) — removed or renamed field still being emitted?"
+                    % (k, label)))
             elif k not in declared:
                 spelled = sorted(f for f in declared if _canon(f) == _canon(k))
                 findings.append(Finding(

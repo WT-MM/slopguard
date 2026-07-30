@@ -60,6 +60,14 @@ def _code_words(code):
     return words
 
 
+_BANNER_RUN = re.compile(r"([─═━=\-#*~_.])\1{3,}")
+
+
+def is_banner(comment_text):
+    """Section-divider comments (`── Pick mode ────`) organize, not restate."""
+    return bool(_BANNER_RUN.search(comment_text))
+
+
 def hedging_phrase(comment_text):
     low = comment_text.lower()
     for phrase in HEDGING_PHRASES:

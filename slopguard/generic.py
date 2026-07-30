@@ -1,7 +1,9 @@
 """Language-agnostic (regex/line-based) checks for non-Python files."""
 import re
 
-from .comments import hedging_phrase, redundancy
+import os
+
+from .comments import hedging_phrase, is_banner, redundancy
 from .findings import Finding
 
 HASH_COMMENT_EXTS = {".rb", ".sh", ".bash", ".zsh", ".yaml", ".yml"}
@@ -149,11 +151,13 @@ def _comments(findings, path, lines, ext):
             continue
         lineno = idx + 1
         phrase = hedging_phrase(comment)
-        if phrase:
+        if phrase and "/examples/" not in path.replace(os.sep, "/"):
             findings.append(Finding(
                 "hedging-comment", "warn", path, lineno,
                 "hedging comment (\"%s...\") — implement the real thing or file a TODO with a ticket" % phrase))
             continue
+        if is_banner(comment):
+            continue  # section dividers organize, they don't restate
         code = code_part.strip() or next_code_line(idx + 1)
         if not code:
             continue

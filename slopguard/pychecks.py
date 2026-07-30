@@ -1,23 +1,36 @@
 """Python-specific AST checks for AI-generated slop."""
 import ast
 import io
+import os
+import re
+import sys
 import tokenize
 
-from .comments import hedging_phrase, redundancy
+from .comments import hedging_phrase, is_banner, redundancy
 from .findings import Finding
 
 _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 _BLOCK_NODES = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)
 _TERMINATORS = (ast.Return, ast.Raise, ast.Break, ast.Continue)
 _SKIP_DECORATORS = {"skip", "skipif", "xfail"}
+# Null-object / test-double classes have no-op methods by design.
+_NOOP_CLASS_NAME = re.compile(r"noop|null|dummy|fake|mock|stub", re.I)
+_NOOP_FILE_NAME = re.compile(r"^(mock|fake|stub)s?_|_(mock|fake|stub)s?\.py$", re.I)
 
 
 def check_python(path, text, cfg):
     try:
         tree = ast.parse(text)
     except SyntaxError as e:
-        return [Finding("syntax-error", "error", path, getattr(e, "lineno", 1) or 1,
-                        "file does not parse: %s" % e.msg)]
+        interpreter = "%d.%d" % sys.version_info[:2]
+        if sys.version_info < (3, 10) and re.search(r"^\s*match\s+.+:\s*(#.*)?$", text, re.M):
+            return [Finding(
+                "syntax-error", "info", path, getattr(e, "lineno", 1) or 1,
+                "does not parse under Python %s (slopguard's interpreter) but uses "
+                "match statements — likely valid on the newer Python it targets" % interpreter)]
+        return [Finding(
+            "syntax-error", "error", path, getattr(e, "lineno", 1) or 1,
+            "file does not parse under Python %s: %s" % (interpreter, e.msg))]
     except (ValueError, RecursionError):
         return []
 
@@ -28,7 +41,7 @@ def check_python(path, text, cfg):
     _placeholder_bodies(findings, path, nodes, parents)
     _dead_code(findings, path, nodes)
     _exception_handling(findings, path, nodes)
-    _unused_imports(findings, path, tree, nodes)
+    _unused_imports(findings, path, tree, nodes, text)
     _unused_private(findings, path, tree, nodes)
     _write_only_attrs(findings, path, nodes)
     _size_and_nesting(findings, path, nodes, cfg)
@@ -83,12 +96,18 @@ def _mutable_defaults(findings, path, nodes):
 
 
 def _placeholder_bodies(findings, path, nodes, parents):
+    if _NOOP_FILE_NAME.search(os.path.basename(path)):
+        return  # mock_/fake_ backends: no-op methods are the design
     for fn in (n for n in nodes if isinstance(n, _FUNC_NODES)):
+        if _is_dunder(fn.name):
+            continue  # `__exit__: pass` and friends are correct implementations
         decs = _decorator_names(fn)
         if any("abstract" in d or d == "overload" or d in _SKIP_DECORATORS
                for d in decs):
             continue
         parent = parents.get(fn)
+        if isinstance(parent, ast.ClassDef) and _NOOP_CLASS_NAME.search(parent.name):
+            continue  # null-object pattern
         if isinstance(parent, ast.ClassDef):
             base_names = set()
             for b in parent.bases:
@@ -170,26 +189,39 @@ def _exception_handling(findings, path, nodes):
             "or make suppression explicit with contextlib.suppress"))
 
 
-def _top_level_imports(nodes):
-    """(local_name, lineno) pairs; indented imports are often conditional/optional — skip."""
+def _top_level_imports(nodes, text):
+    """(local_name, lineno) pairs; indented imports are often conditional/optional — skip.
+    Imports carrying a noqa anywhere in their line span (side-effect
+    registrations) and `_`/`__` aliases (the intentionally-unused idiom) are
+    exempt."""
+    lines = text.splitlines()
+
+    def spans_noqa(node):
+        end = getattr(node, "end_lineno", node.lineno)
+        return any("noqa" in lines[i] for i in range(node.lineno - 1, min(end, len(lines))))
+
     imported = []
     for node in nodes:
         if getattr(node, "col_offset", 0) != 0:
             continue
+        if not isinstance(node, (ast.Import, ast.ImportFrom)) or spans_noqa(node):
+            continue
         if isinstance(node, ast.Import):
-            imported.extend(
-                (a.asname or a.name.split(".")[0], node.lineno)
-                for a in node.names if a.asname or "." not in a.name)
-        elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
-            imported.extend((a.asname or a.name, node.lineno)
-                            for a in node.names if a.name != "*")
+            names = ((a.asname or a.name.split(".")[0], node.lineno)
+                     for a in node.names if a.asname or "." not in a.name)
+        elif node.module != "__future__":
+            names = ((a.asname or a.name, node.lineno)
+                     for a in node.names if a.name != "*")
+        else:
+            continue
+        imported.extend((n, ln) for n, ln in names if n not in ("_", "__"))
     return imported
 
 
-def _unused_imports(findings, path, tree, nodes):
+def _unused_imports(findings, path, tree, nodes, text):
     if path.endswith("__init__.py"):
         return
-    imported = _top_level_imports(nodes)
+    imported = _top_level_imports(nodes, text)
     if not imported:
         return
     used = {n.id for n in nodes if isinstance(n, ast.Name)}
@@ -216,11 +248,17 @@ def _unused_private(findings, path, tree, nodes):
     for node in tree.body:
         if isinstance(node, _FUNC_NODES + (ast.ClassDef,)):
             name = node.name
-            if name.startswith("_") and not _is_dunder(name) and name not in loads and name not in attr_refs:
-                findings.append(Finding(
-                    "unused-private", "warn", path, node.lineno,
-                    "private %s `%s` is never used in this file" %
-                    ("class" if isinstance(node, ast.ClassDef) else "function", name)))
+            if not name.startswith("_") or _is_dunder(name):
+                continue
+            if name in loads or name in attr_refs:
+                continue
+            if isinstance(node, _FUNC_NODES) and \
+                    any("fixture" in d for d in _decorator_names(node)):
+                continue  # pytest fixtures are invoked by the framework
+            findings.append(Finding(
+                "unused-private", "warn", path, node.lineno,
+                "private %s `%s` is never used in this file" %
+                ("class" if isinstance(node, ast.ClassDef) else "function", name)))
 
     for cls in (n for n in nodes if isinstance(n, ast.ClassDef)):
         for m in cls.body:
@@ -353,11 +391,13 @@ def _comments(findings, path, text):
                 "`# type: ignore` hides a type error — fix the type instead"))
             continue
         phrase = hedging_phrase(comment)
-        if phrase:
+        if phrase and "/examples/" not in path.replace(os.sep, "/"):
             findings.append(Finding(
                 "hedging-comment", "warn", path, tok.start[0],
                 "hedging comment (\"%s...\") — implement the real thing or file a TODO with a ticket" % phrase))
             continue
+        if is_banner(comment):
+            continue  # section dividers organize, they don't restate
         code_part = lines[tok.start[0] - 1][:tok.start[1]].strip()
         code = code_part if code_part else next_code_line(tok.start[0])
         if not code:
