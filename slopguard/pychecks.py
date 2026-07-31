@@ -22,7 +22,11 @@ _DEFAULT_OWNING_METADATA = {
     "Query", "Security",
 }
 _FRAMEWORK_MODULES = {"fastapi"}
-_MARKER_BASES = {"object", "Generic", "Protocol", "ABC", "ABCMeta"}
+_MARKER_BASE_MEMBERS = {
+    "typing": {"Generic", "Protocol"},
+    "typing_extensions": {"Generic", "Protocol"},
+    "abc": {"ABC", "ABCMeta"},
+}
 
 
 def check_python(path, text, cfg):
@@ -44,13 +48,14 @@ def check_python(path, text, cfg):
     findings = []
     nodes = list(ast.walk(tree))
     parents = _parent_map(nodes)
+    marker_bases = _marker_base_context(nodes)
     _mutable_defaults(findings, path, nodes, text)
-    _placeholder_bodies(findings, path, nodes, parents)
+    _placeholder_bodies(findings, path, nodes, parents, marker_bases)
     _dead_code(findings, path, nodes)
     _exception_handling(findings, path, nodes, parents)
     _unused_imports(findings, path, tree, nodes, text)
-    _unused_private(findings, path, tree, nodes)
-    _write_only_attrs(findings, path, nodes, parents)
+    _unused_private(findings, path, tree, nodes, marker_bases)
+    _write_only_attrs(findings, path, nodes, parents, marker_bases)
     _size_and_nesting(findings, path, nodes, parents, cfg)
     _single_method_classes(findings, path, nodes)
     _debug_prints(findings, path, nodes)
@@ -90,15 +95,65 @@ def _decorator_names(fn):
     return names
 
 
-def _terminal_name(node):
-    node = node.value if isinstance(node, ast.Subscript) else node
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    return node.id if isinstance(node, ast.Name) else None
+def _marker_base_context(nodes):
+    names = {}
+    modules = {}
+    for node in nodes:
+        if getattr(node, "col_offset", 0) != 0:
+            continue
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in _MARKER_BASE_MEMBERS:
+                    modules[alias.asname or root] = root
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            members = _MARKER_BASE_MEMBERS.get(root, set())
+            for alias in node.names:
+                if alias.name == "*":
+                    names.update((member, member) for member in members)
+                elif alias.name in members:
+                    names[alias.asname or alias.name] = alias.name
+    return names, modules
 
 
-def _has_runtime_base(cls):
-    return any(_terminal_name(base) not in _MARKER_BASES for base in cls.bases)
+def _marker_base_kind(base, context):
+    names, modules = context
+    base = base.value if isinstance(base, ast.Subscript) else base
+    if isinstance(base, ast.Name):
+        return "object" if base.id == "object" else names.get(base.id)
+    if isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name) \
+            and base.value.id in modules \
+            and base.attr in _MARKER_BASE_MEMBERS[modules[base.value.id]]:
+        return base.attr
+    return None
+
+
+def _is_marker_base(base, context):
+    return _marker_base_kind(base, context) is not None
+
+
+def _is_declaration_base(base, context):
+    return _marker_base_kind(base, context) in {"Protocol", "ABC", "ABCMeta"}
+
+
+def _is_declaration_stub(fn):
+    body = fn.body
+    if body and isinstance(body[0], ast.Expr) \
+            and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        body = body[1:]
+    return bool(body) and all(
+        isinstance(stmt, ast.Pass)
+        or (isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value is Ellipsis)
+        for stmt in body
+    )
+
+
+def _has_runtime_base(cls, context):
+    return any(not _is_marker_base(base, context) for base in cls.bases)
 
 
 def _annotation_context(nodes):
@@ -106,6 +161,7 @@ def _annotation_context(nodes):
     annotated_modules = set()
     metadata_names = set()
     framework_modules = set()
+    # slopguard:ignore duplicate-code — this registry has different import semantics
     for node in nodes:
         if getattr(node, "col_offset", 0) != 0:
             continue
@@ -203,7 +259,7 @@ def _mutable_defaults(findings, path, nodes, text):
                     "mutable default argument in %s(); shared across calls — use None" % fn.name))
 
 
-def _placeholder_bodies(findings, path, nodes, parents):
+def _placeholder_bodies(findings, path, nodes, parents, marker_bases):
     if _NOOP_FILE_NAME.search(os.path.basename(path)):
         return  # mock_/fake_ backends: no-op methods are the design
     for fn in (n for n in nodes if isinstance(n, _FUNC_NODES)):
@@ -217,15 +273,7 @@ def _placeholder_bodies(findings, path, nodes, parents):
         if isinstance(parent, ast.ClassDef) and _NOOP_CLASS_NAME.search(parent.name):
             continue  # null-object pattern
         if isinstance(parent, ast.ClassDef):
-            base_names = set()
-            for b in parent.bases:
-                node = b.value if isinstance(b, ast.Subscript) else b
-                while isinstance(node, ast.Attribute):
-                    base_names.add(node.attr)
-                    node = node.value
-                if isinstance(node, ast.Name):
-                    base_names.add(node.id)
-            if base_names & {"Protocol", "ABC", "ABCMeta"}:
+            if any(_is_declaration_base(base, marker_bases) for base in parent.bases):
                 continue
         body = _body_without_docstring(fn)
         empty = all(
@@ -296,7 +344,9 @@ def _exception_handling(findings, path, nodes, parents):
     for node in nodes:
         if not isinstance(node, ast.ExceptHandler):
             continue
-        if node.type is None:
+        reraises = bool(node.body) and isinstance(node.body[-1], ast.Raise) \
+            and node.body[-1].exc is None
+        if node.type is None and not reraises:
             findings.append(Finding(
                 "bare-except", "warn", path, node.lineno,
                 "bare `except:` catches SystemExit/KeyboardInterrupt too — name the exception"))
@@ -370,7 +420,7 @@ def _unused_imports(findings, path, tree, nodes, text):
                 "`%s` is imported but never used" % name))
 
 
-def _unused_private(findings, path, tree, nodes):
+def _unused_private(findings, path, tree, nodes, marker_bases):
     loads = {n.id for n in nodes
              if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
     attr_refs = {n.attr for n in nodes if isinstance(n, ast.Attribute)}
@@ -391,16 +441,9 @@ def _unused_private(findings, path, tree, nodes):
                 ("class" if isinstance(node, ast.ClassDef) else "function", name)))
 
     for cls in (n for n in nodes if isinstance(n, ast.ClassDef)):
-        cls_bases = set()
-        for b in cls.bases:
-            node = b.value if isinstance(b, ast.Subscript) else b
-            while isinstance(node, ast.Attribute):
-                cls_bases.add(node.attr)
-                node = node.value
-            if isinstance(node, ast.Name):
-                cls_bases.add(node.id)
-        if cls_bases & {"Protocol", "ABC", "ABCMeta"}:
-            continue  # stub methods on protocols/ABCs are declarations, not code
+        declaration_base = any(
+            _is_declaration_base(base, marker_bases) for base in cls.bases
+        )
         for m in cls.body:
             if not isinstance(m, _FUNC_NODES):
                 continue
@@ -409,8 +452,10 @@ def _unused_private(findings, path, tree, nodes):
                 continue
             if _decorator_names(m):
                 continue  # properties / framework decorators register themselves
+            if declaration_base and _is_declaration_stub(m):
+                continue
             if name not in attr_refs and name not in loads:
-                has_base = _has_runtime_base(cls)
+                has_base = _has_runtime_base(cls, marker_bases)
                 findings.append(Finding(
                     "unused-private", "info" if has_base else "warn", path, m.lineno,
                     "private method `%s.%s` is never called in this file%s"
@@ -420,7 +465,7 @@ def _unused_private(findings, path, tree, nodes):
                        " (if it's a framework hook, add a slopguard:ignore comment)")))
 
 
-def _write_only_attrs(findings, path, nodes, parents):
+def _write_only_attrs(findings, path, nodes, parents, marker_bases):
     # Attrs on classes WITH bases may be consumed by the parent (stdlib
     # CookieJar reads _cookies_lock; template methods read child state) —
     # those demote to info.
@@ -452,7 +497,9 @@ def _write_only_attrs(findings, path, nodes, parents):
     for (cls, attr), lineno in sorted(stores.items(), key=lambda kv: kv[1]):
         if attr.startswith("_") and not _is_dunder(attr) and (cls, attr) not in reads:
             findings.append(Finding(
-                "write-only-attr", "info" if _has_runtime_base(cls) else "warn", path, lineno,
+                "write-only-attr",
+                "info" if _has_runtime_base(cls, marker_bases) else "warn",
+                path, lineno,
                 "`self.%s` is assigned but never read in this file — state added \"just in case\"?" % attr))
 
 

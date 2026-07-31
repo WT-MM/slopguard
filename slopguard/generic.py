@@ -17,6 +17,9 @@ _EMPTY_PROMISE_CATCH = re.compile(
     r"\.catch\(\s*(?:\([^)]*\)|\w+)\s*=>\s*\{\s*\}\s*\)")
 _AS_ANY = re.compile(r"\bas\s+any\b")
 _TS_IGNORE = re.compile(r"@ts-(ignore|nocheck)\b")
+_ESLINT_LINE_DIRECTIVE = re.compile(
+    r"^\s*eslint-disable-(next-line|line)\b"
+    r"(?P<rules>[^-]*(?:-(?!-)[^-]*)*)")
 _CONSOLE = re.compile(r"\bconsole\.(log|debug)\s*\(")
 # TS/Kotlin/Swift/Scala: the field/method name comes right after `private` and
 # its modifiers. Java/C#: the type comes first, so the name is the last
@@ -135,6 +138,8 @@ _GO_DECL = re.compile(r"^(func|type|var|const)\b|^[A-Z]\w*[\s(]")
 def _comments(findings, path, lines, ext):
     marker = "#" if ext in HASH_COMMENT_EXTS else "//"
     banner_lines = set()
+    in_jsdoc = False
+    jsdoc_example = False
 
     def next_code_line(after_idx):
         for j in range(after_idx, len(lines)):
@@ -144,8 +149,19 @@ def _comments(findings, path, lines, ext):
         return None
 
     for idx, line in enumerate(lines):
+        stripped_line = line.strip()
+        if stripped_line.startswith("/**"):
+            in_jsdoc = True
+            jsdoc_example = False
+        if in_jsdoc and re.match(r"^\*\s*@example\b", stripped_line):
+            jsdoc_example = True
+        elif in_jsdoc and re.match(r"^\*\s*@\w+", stripped_line):
+            jsdoc_example = False
         code_part, comment = _split_comment(line, marker)
         if comment is None:
+            if in_jsdoc and "*/" in line:
+                in_jsdoc = False
+                jsdoc_example = False
             continue
         comment = comment.strip()
         if not comment or "slopguard:" in comment or comment.startswith(("!", "/")):
@@ -163,7 +179,10 @@ def _comments(findings, path, lines, ext):
         if lineno - 1 in banner_lines:
             banner_lines.add(lineno)
             continue  # the title line under a banner divider
-        if code_part.strip().startswith(("*", "/*")):
+        if in_jsdoc and jsdoc_example and code_part.strip().startswith("*"):
+            if "*/" in line:
+                in_jsdoc = False
+                jsdoc_example = False
             continue  # inside a JSDoc block: @example output annotations aren't comments-about-code
         code = code_part.strip() or next_code_line(idx + 1)
         if not code:
@@ -179,6 +198,9 @@ def _comments(findings, path, lines, ext):
             findings.append(Finding(
                 "redundant-comment", "info", path, lineno,
                 "comment mostly restates the code (\"%s\")" % comment[:60]))
+        if in_jsdoc and "*/" in line:
+            in_jsdoc = False
+            jsdoc_example = False
 
 
 def _empty_catches(findings, path, text, raw):
@@ -208,8 +230,18 @@ def _type_escapes(findings, path, code_lines, raw_lines):
     # `as any` is code, so match the masked text; @ts-ignore is a comment
     # DIRECTIVE, so it must be matched in the raw line the mask erased.
     def eslint_documented(idx, marker):
-        for j in (idx - 1, idx):
-            if 0 <= j < len(raw_lines) and "eslint-disable" in raw_lines[j] and marker in raw_lines[j]:
+        for j, expected_kind in ((idx - 1, "next-line"), (idx, "line")):
+            if not 0 <= j < len(raw_lines):
+                continue
+            _, comment = _split_comment(raw_lines[j], "//")
+            directive = _ESLINT_LINE_DIRECTIVE.search(comment or "")
+            if directive is None or directive.group(1) != expected_kind:
+                continue
+            rules = {
+                rule.strip().split("/")[-1]
+                for rule in directive.group("rules").split(",")
+            }
+            if marker in rules:
                 return True
         return False
 

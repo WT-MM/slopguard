@@ -78,7 +78,12 @@ def _run(args):
                        schema_texts=schema_texts, fingerprint_root=root,
                        function_duplicates=function_duplicates)
     findings, _hidden = apply_baseline(findings, baseline_fps)
-    blocking = at_or_above(findings, "warn")
+    fail_on = cfg.get("fail_on", "warn")
+    if fail_on == "never":
+        return 0
+    if fail_on not in ("warn", "error"):
+        fail_on = "warn"
+    blocking = at_or_above(findings, fail_on)
     if not blocking:
         return 0
 
@@ -87,12 +92,14 @@ def _run(args):
 
     lines = [f.format() for f in sort_findings(blocking)]
     shown = lines[:MAX_REPORT_LINES]
-    header = ("slopguard found %d issue(s) in the files you just changed. "
-              "Fix them, or add a `slopguard:ignore` comment on the flagged "
-              "line if it is genuinely intentional:" % len(blocking))
+    header = ("slopguard found %d blocking issue(s) in the files you just changed. "
+              "Fix them, or suppress intentional cases with a scoped "
+              "`slopguard:ignore RULE` comment:" % len(blocking))
     body = header + "\n" + "\n".join(shown)
     if len(lines) > len(shown):
         body += "\n... and %d more (run `slopguard scan` for the full list)" % (len(lines) - len(shown))
+    body += ("\nRepo-wide escape hatches: `.slopguard.json` `disable`/`fail_on`; "
+             "for existing debt, run `slopguard baseline .`.")
     print(body, file=sys.stderr)
     return 2
 

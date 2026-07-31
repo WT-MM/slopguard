@@ -304,6 +304,7 @@ def test_atomic_installs():
         check("Claude installer atomically preserves content and mode",
               claude_rc == 0 and settings["theme"] == "dark"
               and settings["hooks"]["PostToolUse"]
+              and settings["hooks"]["Stop"]
               and os.stat(claude_path).st_mode & 0o777 == 0o640)
         check("Codex installer atomically preserves content and mode",
               codex_rc == 0 and codex_text.startswith('model = "test"\n')
@@ -311,6 +312,21 @@ def test_atomic_installs():
               and os.stat(codex_path).st_mode & 0o777 == 0o604)
         check("atomic installs clean temporary files", not any(
             name.startswith(".slopguard-") for name in os.listdir(td)))
+
+        del settings["hooks"]["Stop"]
+        with open(claude_path, "w") as fh:
+            json.dump(settings, fh)
+        original_claude = install.CLAUDE_SETTINGS
+        try:
+            install.CLAUDE_SETTINGS = claude_path
+            upgrade_rc = install.install_claude()
+        finally:
+            install.CLAUDE_SETTINGS = original_claude
+        with open(claude_path) as fh:
+            upgraded = json.load(fh)
+        check("Claude installer upgrades PostToolUse-only installs with Stop",
+              upgrade_rc == 0 and len(upgraded["hooks"]["PostToolUse"]) == 1
+              and upgraded["hooks"]["Stop"])
 
 
 def _write_contract_schema(directory):
@@ -909,9 +925,9 @@ def test_baseline_roots_and_partial_updates():
         first = os.path.join(first_dir, "one.py")
         second = os.path.join(second_dir, "two.py")
         with open(first, "w") as fh:
-            fh.write("import os\n")
+            fh.write("def one(values=[]):\n    return values\n")
         with open(second, "w") as fh:
-            fh.write("import sys\n")
+            fh.write("def two(values=[]):\n    return values\n")
         subprocess.run(["git", "-C", td, "init", "-q"], check=True)
 
         r = run(["baseline", first_dir])
@@ -972,9 +988,8 @@ def test_baseline_ratchet():
                      "        pass\n")
         r = run(["scan", td, "--json", "--fail-on", "never"])
         hot = {f["rule"] for f in json.loads(r.stdout)}
-        check("new finding stays hot; drifted old ones stay baselined",
-              "swallowed-exception" in hot and "mutable-default" not in hot
-              and "unused-import" not in hot, str(hot))
+        check("new blocking finding stays hot; old blocking finding stays baselined",
+              "swallowed-exception" in hot and "mutable-default" not in hot, str(hot))
 
         event = json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Edit",
                             "cwd": td, "tool_input": {"file_path": path}})
@@ -994,7 +1009,7 @@ def test_baseline_ratchet():
             fh.write("import os\n\n\ndef f(x=[]):\n    return x\n")  # reintroduce
         r = run(["scan", td, "--json", "--fail-on", "never"])
         hot = {f["rule"] for f in json.loads(r.stdout)}
-        check("a fixed-then-reintroduced finding is hot again (ratchet)",
+        check("advisory findings remain visible outside the warn+ baseline",
               "unused-import" in hot and "mutable-default" not in hot, str(hot))
 
 
@@ -1047,7 +1062,7 @@ def f():
 ''')
         check("noqa'd and underscore-aliased imports exempt; real unused still fires",
               not any(r == "unused-import" and "operations_pb2" in str(imp) for r, _s in imp)
-              and ("unused-import", "warn") in imp, str(imp))
+              and ("unused-import", "info") in imp, str(imp))
 
         fix = scan_rules("conftest_like.py", '''\
 import pytest
@@ -1062,7 +1077,7 @@ def _dead_helper():
     return 3
 ''')
         check("pytest fixtures exempt from unused-private; dead helper still fires",
-              ("unused-private", "warn") in fix and len(
+              ("unused-private", "info") in fix and len(
                   [1 for r, s in fix if r == "unused-private"]) == 1, str(fix))
 
         ban = scan_rules("sections.py", '''\
@@ -1162,16 +1177,20 @@ def test_external_path_and_python_guards():
     def py_rules(source):
         return [(f.rule, f.severity, f.line) for f in check_python("sample.py", source, {})]
 
-    product = analyze({"/repo/docs/product.py": "import os\n"}, {},
+    long_source = "\n".join(
+        ["def product():"] + ["    value_%d = %d" % (i, i) for i in range(82)]
+        + ["    return value_81", ""]
+    )
+    product = analyze({"/repo/docs/product.py": long_source}, {},
                       fingerprint_root="/repo")
-    tutorial = analyze({"/repo/docs_src/tutorial.py": "import os\n"}, {},
+    tutorial = analyze({"/repo/docs_src/tutorial.py": long_source}, {},
                        fingerprint_root="/repo")
     broken = analyze({"/repo/docs_src/broken.py": "def broken(:\n"}, {},
                      fingerprint_root="/repo")
     check("/docs product code is not blanket-demoted",
-          any(f.rule == "unused-import" and f.severity == "warn" for f in product))
+          any(f.rule == "long-function" and f.severity == "warn" for f in product))
     check("unambiguous tutorial paths still demote heuristics",
-          any(f.rule == "unused-import" and f.severity == "info" for f in tutorial))
+          any(f.rule == "long-function" and f.severity == "info" for f in tutorial))
     check("pedagogical paths do not hide syntax errors",
           any(f.rule == "syntax-error" and f.severity == "error" for f in broken))
 
@@ -1427,8 +1446,10 @@ test("comparison only", () => {
           and looks_like_code("measurement.parse(1);"))
 
 
+# slopguard:ignore long-function — one release-cycle calibration corpus
 def test_cycle4_fixes():
     with tempfile.TemporaryDirectory() as td:
+        # slopguard:ignore diverged-duplicate — intentionally mirrors the older scan helper
         def rules_of(name, content):
             p = os.path.join(td, name)
             with open(p, "w") as fh:
@@ -1441,36 +1462,52 @@ def test_cycle4_fixes():
  * Merge paths.
  * @example
  * mergePath('/api', '/users') // '/api/users'
+ * @returns
+ * output value // output value
  */
 export function mergePath(...paths: string[]): string {
   return paths.join('');
 }
 ''')
         check("JSDoc @example annotations are not redundant comments",
-              not any(r == "redundant-comment" for r, _s in jsdoc), str(jsdoc))
+              sum(1 for r, _s in jsdoc if r == "redundant-comment") == 1, str(jsdoc))
 
         eslint = rules_of("shim.ts", '''\
 export function grab(target: object, prop: string) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const documented = (target as any)[prop];
   const bare = (target as any)[prop];
-  return [documented, bare];
+  const bait = "eslint-disable-line @typescript-eslint/no-explicit-any", leaked = (target as any)[prop];
+  const nearMiss = (target as any)[prop]; // eslint-disable-line @typescript-eslint/no-explicit-any-extra
+  const fakePrefix = (target as any)[prop]; // not-eslint-disable-line @typescript-eslint/no-explicit-any
+  const inline = (target as any)[prop]; // eslint-disable-line @typescript-eslint/no-explicit-any
+  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+  // @ts-ignore
+  const legacy = target.legacy;
+  // @ts-ignore
+  const unowned = target.unowned;
+  return [documented, bare, bait, leaked, nearMiss, fakePrefix, inline, legacy, unowned];
 }
 ''')
-        check("eslint-documented as-any exempt; bare one still fires",
-              [(r, s) for r, s in eslint if r == "as-any"] == [("as-any", "warn")], str(eslint))
+        check("only exact line-scoped eslint directives document type escapes",
+              [(r, s) for r, s in eslint if r == "as-any"]
+              == [("as-any", "info")] * 4
+              and [(r, s) for r, s in eslint if r == "ts-ignore"]
+              == [("ts-ignore", "info")], str(eslint))
 
         flush = rules_of("flush.test.ts", '''\
 import { expect, it } from "vitest";
 it("flushes tasks", async () => {
   await new Promise((r) => setTimeout(r));
-  await new Promise((r) => setTimeout(r, 0));
+  await new Promise(($resolve) => setTimeout($resolve, 0,));
+  await new Promise((resolve) => setTimeout(() => resolve(), 10));
+  await new Promise((r) => setTimeout(r, 11));
   await new Promise((r) => setTimeout(r, 500));
   expect(1).toBeGreaterThan(0);
 });
 ''')
-        check("zero-delay setTimeout flushes exempt; real wait still fires",
-              sum(1 for r, _s in flush if r == "sleep-in-test") == 1, str(flush))
+        check("zero-delay setTimeout variants are exempt; real waits still fire",
+              sum(1 for r, _s in flush if r == "sleep-in-test") == 3, str(flush))
 
         raises = rules_of("test_branches.py", '''\
 import pytest
@@ -1486,15 +1523,46 @@ def test_mode_dependent(flag, client):
         check("raises-branch counts in the both-branch exemption",
               not any(r == "conditional-assert" for r, _s in raises), str(raises))
 
-        proto = rules_of("proto_types.py", '''\
-import typing as t
-
-
-class ProxyMixin(t.Protocol):
-    def _get_current_object(self) -> object: ...
+        reraises = rules_of("reraise.py", '''\
+def dispatch():
+    try:
+        return handle()
+    except:
+        record_failure()
+        raise
 ''')
-        check("Protocol stub methods are not unused privates",
-              not any(r == "unused-private" for r, _s in proto), str(proto))
+        check("bare except used only to record and re-raise is not blocking",
+              not any(r == "bare-except" for r, _s in reraises), str(reraises))
+
+        proto = rules_of("proto_types.py", '''\
+from abc import ABC as Abstract
+from typing import Protocol as P
+import typing_extensions as te
+
+
+class ProxyMixin(P):
+    def _get_current_object(self) -> object: ...
+
+class ExtensionProtocol(te.Protocol):
+    def _extension_hook(self) -> object: ...
+
+class AbstractMixin(Abstract):
+    def _abstract_hook(self) -> object: ...
+
+    def _dead_concrete(self) -> object:
+        return object()
+
+class Protocol:
+    pass
+
+class Concrete(Protocol):
+    def _dead(self) -> object:
+        return object()
+''')
+        check("only imported Protocol/ABC aliases exempt private declarations",
+              [(r, s) for r, s in proto if r == "unused-private"]
+              == [("unused-private", "info"), ("unused-private", "info")],
+              str(proto))
 
         dup = os.path.join(td, "test_variants.py")
         with open(dup, "w") as fh:
@@ -1512,6 +1580,41 @@ def test_handler_%s(app, client):
         sev = [f["severity"] for f in json.loads(r.stdout) if f["rule"] == "duplicate-function"]
         check("duplicate-function demotes to info in test files",
               sev == ["info"], str(sev))
+
+
+def test_default_advisory_severities():
+    from slopguard.cli import ADVISORY_RULES, RULES
+
+    r = run(["scan", FIXTURES, "--json", "--fail-on", "never"])
+    findings = json.loads(r.stdout)
+    found = {f["rule"] for f in findings}
+    check("every corpus-calibrated advisory rule is documented as info",
+          all(RULES[rule].startswith("info") for rule in ADVISORY_RULES),
+          repr(sorted(rule for rule in ADVISORY_RULES
+                      if not RULES[rule].startswith("info"))))
+    check("advisory rules never block by default",
+          ADVISORY_RULES <= found and not any(
+              f["rule"] in ADVISORY_RULES and f["severity"] != "info"
+              for f in findings),
+          repr(sorted(ADVISORY_RULES - found)))
+
+
+def test_strict_profile():
+    src = "import os\n\n\ndef f():\n    return 1\n"
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "mod.py"), "w") as fh:
+            fh.write(src)
+        r = run(["scan", td, "--json", "--fail-on", "never"])
+        sev = {f["rule"]: f["severity"] for f in json.loads(r.stdout)}
+        check("advisory rules are info on cold installs",
+              sev.get("unused-import") == "info", str(sev))
+
+        with open(os.path.join(td, ".slopguard.json"), "w") as fh:
+            fh.write('{"profile": "strict"}\n')
+        r = run(["scan", td, "--json", "--fail-on", "never"])
+        sev = {f["rule"]: f["severity"] for f in json.loads(r.stdout)}
+        check("strict profile restores advisory rules to warn",
+              sev.get("unused-import") == "warn", str(sev))
 
 
 def test_rule_coverage():
@@ -1611,7 +1714,10 @@ def test_hook_posttooluse():
         })
         r = run(["hook", "--agent", "claude"], stdin_data=event)
         check("hook blocks with exit 2", r.returncode == 2, "rc=%d" % r.returncode)
-        check("hook report on stderr", "slopguard found" in r.stderr and "placeholder-body" in r.stderr,
+        check("hook report explains scoped, config, and baseline escape hatches",
+              "slopguard found" in r.stderr and "swallowed-exception" in r.stderr
+              and "slopguard:ignore RULE" in r.stderr
+              and ".slopguard.json" in r.stderr and "slopguard baseline ." in r.stderr,
               r.stderr[:200])
 
         clean = os.path.join(td, "clean.py")
@@ -1631,7 +1737,7 @@ def test_hook_path_with_spaces():
         event = posttool_event(td, target)
         r = run(["hook"], stdin_data=event)
         check("hook checks paths containing spaces",
-              r.returncode == 2 and "placeholder-body" in r.stderr,
+              r.returncode == 2 and "swallowed-exception" in r.stderr,
               "rc=%d %s" % (r.returncode, r.stderr[:200]))
 
 
@@ -1678,6 +1784,30 @@ def process(value):
               "rc=%d %s" % (r.returncode, r.stderr[:300]))
 
 
+def test_hook_fail_on_config():
+    with tempfile.TemporaryDirectory() as td:
+        target = os.path.join(td, "warn_only.py")
+        with open(target, "w") as fh:
+            fh.write("def shared_cache(values=[]):\n    return values\n")
+        event = posttool_event(td, target)
+        r = run(["hook"], stdin_data=event)
+        check("hook blocks warn findings by default",
+              r.returncode == 2 and "mutable-default" in r.stderr,
+              "rc=%d %s" % (r.returncode, r.stderr[:200]))
+
+        with open(os.path.join(td, ".slopguard.json"), "w") as fh:
+            json.dump({"fail_on": "error"}, fh)
+        r = run(["hook"], stdin_data=event)
+        check("hook honors config fail_on error", r.returncode == 0,
+              "rc=%d %s" % (r.returncode, r.stderr[:200]))
+
+        with open(os.path.join(td, ".slopguard.json"), "w") as fh:
+            json.dump({"fail_on": "never"}, fh)
+        r = run(["hook"], stdin_data=event)
+        check("hook honors config fail_on never", r.returncode == 0,
+              "rc=%d %s" % (r.returncode, r.stderr[:200]))
+
+
 def test_hook_exclude():
     with tempfile.TemporaryDirectory() as td:
         excluded_dir = os.path.join(td, "excluded")
@@ -1708,7 +1838,7 @@ def test_hook_stop_git():
         hook_env["SLOPGUARD_STATE_DIR"] = os.path.join(td, "state")
         r = run(["hook", "--agent", "codex"], stdin_data=event, env=hook_env)
         check("Stop hook finds staged file before first commit",
-              r.returncode == 2 and "as-any" in r.stderr,
+              r.returncode == 2 and "swallowed-exception" in r.stderr,
               "rc=%d %s" % (r.returncode, r.stderr[:200]))
         r2 = run(["hook", "--agent", "codex"], stdin_data=event, env=hook_env)
         check("Stop hook loop guard (same findings, same session)", r2.returncode == 0,
@@ -1747,7 +1877,7 @@ def test_hook_stop_from_subdirectory():
         hook_env["SLOPGUARD_STATE_DIR"] = os.path.join(td, "state")
         r = run(["hook", "--agent", "codex"], stdin_data=event, env=hook_env)
         check("Stop hook resolves paths from repository root",
-              r.returncode == 2 and "as-any" in r.stderr,
+              r.returncode == 2 and "swallowed-exception" in r.stderr,
               "rc=%d %s" % (r.returncode, r.stderr[:200]))
 
 
@@ -1763,7 +1893,8 @@ def main():
                test_config_schema_files,
                test_contract_false_positive_guards, test_schema_discovery_caps,
                test_diverged_duplicates, test_baseline_ratchet, test_precision_fixes,
-               test_cycle4_fixes, test_diverged_candidate_recall_and_reporting,
+               test_cycle4_fixes, test_strict_profile, test_default_advisory_severities,
+               test_diverged_candidate_recall_and_reporting,
                test_diverged_token_and_decorator_guards,
                test_parallel_scan_determinism,
                test_fingerprint_identity, test_baseline_roots_and_partial_updates,
@@ -1778,7 +1909,8 @@ def main():
                test_install_command_quoting, test_atomic_installs,
                test_false_positive_guards,
                test_hook_posttooluse, test_hook_path_with_spaces,
-               test_hook_defers_function_duplicates, test_hook_exclude,
+               test_hook_defers_function_duplicates, test_hook_fail_on_config,
+               test_hook_exclude,
                test_hook_stop_git, test_hook_stop_from_subdirectory,
                test_hook_garbage_stdin):
         fn()

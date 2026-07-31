@@ -44,10 +44,18 @@ _SCHEMA_DATA_EXTS = {".json", ".yaml", ".yml"}
 MAX_SCHEMA_FILES = 200
 MAX_FILE_BYTES = 512 * 1024
 MAX_SCAN_FILES = 4000
-TEST_RELAXED_RULES = {"as-any", "ts-ignore", "duplicate-code", "debug-artifact",
-                      "long-function", "deep-nesting", "diverged-duplicate",
-                      "hand-rolled-contract", "contract-drift-key",
-                      "placeholder-body", "write-only-attr", "hedging-comment"}
+ADVISORY_RULES = {
+    "as-any", "brittle-exact-string", "conditional-assert",
+    "diverged-duplicate", "duplicate-code", "excessive-mocking",
+    "hedging-comment", "mock-echo-test", "no-assert-test",
+    "overspecified-assert", "placeholder-body", "private-poke-test",
+    "redundant-comment", "ts-ignore", "unused-import", "unused-private",
+    "write-only-attr",
+}
+TEST_RELAXED_RULES = {
+    "contract-drift-key", "deep-nesting", "hand-rolled-contract",
+    "long-function",
+}
 _TEST_PATH_PARTS = ("/tests/", "/test/", "/__tests__/", "/spec/")
 # Pedagogical / intentionally-parallel code: tutorial sources, example apps,
 # per-language locale files, benchmark bodies. `/docs/` is deliberately not
@@ -82,38 +90,38 @@ def is_test_file(path):
             or any(part in norm for part in _TEST_PATH_PARTS))
 
 RULES = {
-    "duplicate-function": "error  py       structurally identical function already exists (names normalized)",
+    "duplicate-function": "error  py       structurally identical function already exists (info in tests)",
     "dead-code":          "error  py       unreachable statements after return/raise/break/continue",
     "syntax-error":       "error  py       file does not parse",
-    "diverged-duplicate": "warn   py       function ~60-97% identical to another — a fork drifting apart",
-    "duplicate-code":     "warn   all      copy-pasted block (~6+ normalized lines) appears elsewhere",
-    "unused-private":     "warn   py,ts,…  private function/method/field never referenced in its file",
-    "write-only-attr":    "warn   py       self._attr assigned but never read",
-    "unused-import":      "warn   py       import never used",
-    "placeholder-body":   "warn   py       function body is pass/... — looks implemented, does nothing",
+    "diverged-duplicate": "info   py       function ~60-97% identical to another — a fork drifting apart",
+    "duplicate-code":     "info   all      copy-pasted block (~6+ normalized lines) appears elsewhere",
+    "unused-private":     "info   py,ts,…  private function/method/field never referenced in its file",
+    "write-only-attr":    "info   py       self._attr assigned but never read",
+    "unused-import":      "info   py       import never used",
+    "placeholder-body":   "info   py       function body is pass/... — looks implemented, does nothing",
     "swallowed-exception":"warn   py,js,…  except:pass / empty catch block",
     "bare-except":        "warn   py       bare `except:`",
     "mutable-default":    "warn   py       mutable default argument",
-    "hedging-comment":    "warn   all      \"in a real implementation...\"-style cop-out comments",
-    "redundant-comment":  "warn   all      comment restates the code (warn if fully, info if mostly)",
+    "hedging-comment":    "info   all      \"in a real implementation...\"-style cop-out comments",
+    "redundant-comment":  "info   all      comment restates the code",
     "long-function":      "warn   py       function longer than max_function_lines (default 80)",
     "deep-nesting":       "warn   py       nesting deeper than max_nesting (default 4)",
-    "as-any":             "warn   ts       `as any` cast",
-    "ts-ignore":          "warn   ts       @ts-ignore / @ts-nocheck",
+    "as-any":             "info   ts       `as any` cast",
+    "ts-ignore":          "info   ts       @ts-ignore / @ts-nocheck",
     "contract-drift-key": "warn   py       camelCase key with no schema field, in a dict that speaks the schema",
     "hand-rolled-contract":"warn  py       dict literal hand-builds a schema-defined message",
     "contract-case-skew": "info   py       in-sync hand-mapping of a schema field (parentFrame for parent_frame)",
-    "no-assert-test":     "warn   tests    test never asserts — only proves the code doesn't crash",
+    "no-assert-test":     "info   tests    test never asserts — only proves the code doesn't crash",
     "mock-only-test":     "info   tests    every assertion is a mock-call assertion — 0% precision on driver-style tests, demoted pending better discrimination",
-    "mock-echo-test":     "warn   tests    asserts the exact value the mock was told to return",
+    "mock-echo-test":     "info   tests    asserts the exact value the mock was told to return",
     "tautological-assert":"warn   tests    assert True / expect(x).toBe(x) — always passes",
-    "conditional-assert": "warn   tests    assertion inside an `if` — only checks on some paths",
-    "brittle-exact-string":"warn  tests    equality against a long literal string",
-    "overspecified-assert":"warn  tests    equality against a big literal dict/list — pins every field",
+    "conditional-assert": "info   tests    assertion inside an `if` — only checks on some paths",
+    "brittle-exact-string":"info  tests    equality against a long literal string",
+    "overspecified-assert":"info  tests    equality against a big literal dict/list — pins every field",
     "parametrize-candidate":"warn tests    3+ tests identical except literals — collapse to one parametrized test",
-    "private-poke-test":  "warn   tests    test reads `_private` internals instead of the public API",
-    "excessive-mocking":  "warn   tests    6+ mocks in one test — tests the wiring diagram",
-    "sleep-in-test":      "warn   tests    real sleep/setTimeout wait — slow and flaky",
+    "private-poke-test":  "info   tests    test reads `_private` internals instead of the public API",
+    "excessive-mocking":  "info   tests    6+ mocks in one test — tests the wiring diagram",
+    "sleep-in-test":      "warn   tests    real sleep or nonzero setTimeout — slow/flaky",
     "type-ignore":        "info   py       `# type: ignore`",
     "single-method-class":"info   py       class wrapping a single method",
     "debug-artifact":     "info   py,js    print()/console.log leftovers",
@@ -341,7 +349,13 @@ def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False,
     # Patterns that are conventional in tests (mock casts, repeated setup
     # blocks) drop to info there instead of blocking; structural heuristics in
     # pedagogical paths (tutorial sources, locales, benchmarks) do likewise.
+    strict = cfg.get("profile") == "strict"
     for f in findings:
+        # Cold-install default: rules with sub-50% measured precision on
+        # unfamiliar repos stay visible but don't block. `"profile": "strict"`
+        # restores blocking for tuned repos (where the same rules measure well).
+        if f.rule in ADVISORY_RULES and not strict:
+            f.severity = "info"
         if f.severity == "warn" and f.rule in TEST_RELAXED_RULES and is_test_file(f.file):
             f.severity = "info"
         # Per-variant test copies are a convention (fastapi tutorials, flask
@@ -600,6 +614,8 @@ def cmd_scan(args):
             print("(%d baselined finding(s) hidden — `slopguard scan --no-baseline` shows them)"
                   % hidden)
     fail_on = args.fail_on or cfg.get("fail_on", "warn")
+    if fail_on not in ("warn", "error", "never"):
+        fail_on = "warn"
     if fail_on != "never" and at_or_above(findings, fail_on):
         return 1
     return 0

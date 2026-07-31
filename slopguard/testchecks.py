@@ -437,6 +437,66 @@ _TAUTOLOGY = re.compile(
 _JS_SLEEP = re.compile(r"new\s+Promise\s*\([^;\n]*setTimeout")
 _LONG_STR_EXPECT = re.compile(r"\.\s*to(?:Be|Equal|StrictEqual|Contain)\(\s*[`'\"]([^`'\"]{%d,})" % LONG_STRING_ASSERT)
 _JS_MOCKS = re.compile(r"\b(?:jest|vi)\s*\.\s*(?:mock|spyOn|fn)\s*\(")
+def _timeout_args(text, offset):
+    """Split setTimeout(...) arguments without caring what the callback is."""
+    i = offset
+    while i < len(text) and text[i].isspace():
+        i += 1
+    if i >= len(text) or text[i] != "(":
+        return None
+    args, current = [], []
+    depth = 1
+    quote = None
+    i += 1
+    while i < len(text):
+        char = text[i]
+        if quote is not None:
+            current.append(char)
+            if char == "\\" and i + 1 < len(text):
+                current.append(text[i + 1])
+                i += 2
+                continue
+            if char == quote:
+                quote = None
+        elif text.startswith("//", i):
+            newline = text.find("\n", i + 2)
+            i = len(text) if newline < 0 else newline
+            continue
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = len(text) if end < 0 else end + 2
+            continue
+        elif char in "\"'`":
+            quote = char
+            current.append(char)
+        elif char in "([{":
+            depth += 1
+            current.append(char)
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(current).strip())
+                return args
+            current.append(char)
+        elif char == "," and depth == 1:
+            args.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+        i += 1
+    return None
+
+
+def _zero_delay_flush(text, offset):
+    args = _timeout_args(text, offset)
+    if not args or len(args) == 1 or not args[1]:
+        return bool(args)  # omitted delay is specified as zero
+    delay = args[1].replace("_", "").strip()
+    try:
+        value = int(delay, 0) if re.match(r"^[+-]?0[xob]", delay, re.I) else float(delay)
+    except ValueError:
+        return False
+    return value == 0
 
 
 def _js_string_literals(text):
@@ -548,9 +608,8 @@ def check_generic_tests(path, text, cfg, ext):
                 "tautological-assert", "warn", path, lineno + block.count("\n", 0, m.start()),
                 "expect(x).toBe(x) — always passes, tests nothing"))
         for m in _JS_SLEEP.finditer(block):
-            tail = block[m.end():m.end() + 40]
-            if re.match(r"\s*\(\s*\w+\s*(?:,\s*0\s*)?\)", tail):
-                continue  # setTimeout(resolve) / (resolve, 0): microtask flush, not a wait
+            if _zero_delay_flush(block, m.end()):
+                continue  # zero-delay scheduling flush, not a meaningful wait
             findings.append(Finding(
                 "sleep-in-test", "warn", path, lineno + block.count("\n", 0, m.start()),
                 "real setTimeout wait in a test — use fake timers or poll a condition"))

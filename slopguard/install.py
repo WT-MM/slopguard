@@ -66,17 +66,32 @@ def install_claude():
     command = hook_command("claude")
     hooks = settings.setdefault("hooks", {})
     post = hooks.setdefault("PostToolUse", [])
-    for entry in post:
-        for h in entry.get("hooks", []):
-            if "slopguard" in h.get("command", ""):
-                print("already installed in %s" % CLAUDE_SETTINGS)
-                return 0
-    post.append({
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [{"type": "command", "command": command, "timeout": 30}],
-    })
+    stop = hooks.setdefault("Stop", [])
+
+    def installed(entries):
+        return any(
+            "slopguard" in hook.get("command", "")
+            for entry in entries if isinstance(entry, dict)
+            for hook in entry.get("hooks", []) if isinstance(hook, dict)
+        )
+
+    changed = False
+    if not installed(post):
+        post.append({
+            "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+            "hooks": [{"type": "command", "command": command, "timeout": 30}],
+        })
+        changed = True
+    if not installed(stop):
+        stop.append({
+            "hooks": [{"type": "command", "command": command, "timeout": 60}],
+        })
+        changed = True
+    if not changed:
+        print("already installed in %s" % CLAUDE_SETTINGS)
+        return 0
     _atomic_write(CLAUDE_SETTINGS, json.dumps(settings, indent=2) + "\n")
-    print("installed PostToolUse hook in %s" % CLAUDE_SETTINGS)
+    print("installed PostToolUse and Stop hooks in %s" % CLAUDE_SETTINGS)
     return 0
 
 
