@@ -34,9 +34,18 @@ _JS_PRIVATE_FIELD = re.compile(r"^\s*#([A-Za-z_]\w*)\s*[;=]")
 _DECL_KEYWORDS = {"constructor", "readonly", "static", "final", "get", "set", "new", "return", "async"}
 
 
+YAML_EXTS = {".yaml", ".yml"}
+
+
 def check_generic(path, text, cfg, ext):
     findings = []
     lines = text.splitlines()
+    marker = "#" if ext in HASH_COMMENT_EXTS or ext in YAML_EXTS else "//"
+    _long_comment_blocks(findings, path, lines, marker, cfg)
+    if ext in YAML_EXTS:
+        # Only the comment-length rule runs on YAML: the code-vs-comment
+        # heuristics assume executable source.
+        return findings
     code = _mask_non_code(text)
     code_lines = code.splitlines()
     _comments(findings, path, lines, ext)
@@ -133,6 +142,24 @@ def _split_comment(line, marker):
 # Go declarations (and interface methods / struct fields with exported names)
 # carry godoc comments that begin with the identifier by convention.
 _GO_DECL = re.compile(r"^(func|type|var|const)\b|^[A-Z]\w*[\s(]")
+
+
+def _long_comment_blocks(findings, path, lines, marker, cfg):
+    max_lines = cfg.get("max_comment_lines", 6)
+    start = count = 0
+    for idx, line in enumerate(lines + [""], 1):
+        s = line.strip()
+        if s.startswith(marker) and not s.startswith("#!"):
+            if not count:
+                start = idx
+            count += 1
+            continue
+        if count > max_lines:
+            findings.append(Finding(
+                "long-comment", "warn", path, start,
+                "%d-line comment block — keep it under %d lines or move the "
+                "story to the PR/commit message" % (count, max_lines)))
+        count = 0
 
 
 def _comments(findings, path, lines, ext):

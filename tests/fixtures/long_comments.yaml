@@ -1,0 +1,12 @@
+# This block narrates the pipeline in prose that belongs in the PR
+# description rather than the config file, because every line here
+# will drift out of date the moment the numbers change.
+# It keeps going with implementation details and timing claims,
+# quoting run durations and file counts that no test pins down.
+# Two more lines push it past the default six-line threshold
+# so the long-comment rule has something deterministic to flag.
+name: fixture
+jobs:
+  noop:
+    steps:
+      - run: "true"  # short trailing comment stays fine

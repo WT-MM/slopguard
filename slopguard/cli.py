@@ -25,6 +25,8 @@ SUPPORTED_EXTS = {
     ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".rs",
     ".java", ".kt", ".swift", ".cs", ".rb", ".php", ".c", ".cc", ".cpp",
     ".h", ".hpp", ".scala", ".sh",
+    # comment-length rule only (see check_generic)
+    ".yaml", ".yml",
 }
 IGNORED_DIR_PARTS = {
     "node_modules", ".git", ".hg", ".venv", "venv", "env", "dist", "build",
@@ -47,7 +49,7 @@ MAX_SCAN_FILES = 4000
 ADVISORY_RULES = {
     "as-any", "brittle-exact-string", "conditional-assert",
     "diverged-duplicate", "duplicate-code", "excessive-mocking",
-    "hedging-comment", "mock-echo-test", "no-assert-test",
+    "hedging-comment", "long-comment", "mock-echo-test", "no-assert-test",
     "overspecified-assert", "placeholder-body", "private-poke-test",
     "redundant-comment", "ts-ignore", "unused-import", "unused-private",
     "write-only-attr",
@@ -104,6 +106,7 @@ RULES = {
     "mutable-default":    "warn   py       mutable default argument",
     "hedging-comment":    "info   all      \"in a real implementation...\"-style cop-out comments",
     "redundant-comment":  "info   all      comment restates the code",
+    "long-comment":       "info   yml,js,… comment block longer than max_comment_lines (default 6)",
     "long-function":      "warn   py       function longer than max_function_lines (default 80)",
     "deep-nesting":       "warn   py       nesting deeper than max_nesting (default 4)",
     "as-any":             "info   ts       `as any` cast",
@@ -335,7 +338,8 @@ def analyze(texts, cfg, report_files=None, schema_texts=None, parallel=False,
         for item in items:
             findings.extend(_file_findings(item))
 
-    findings.extend(find_duplicate_blocks(texts))
+    findings.extend(find_duplicate_blocks(
+        {p: t for p, t in texts.items() if not p.endswith((".yaml", ".yml"))}))
     if function_duplicates:
         py_texts = {p: t for p, t in texts.items() if p.endswith(PY_EXT)}
         findings.extend(find_duplicate_functions(

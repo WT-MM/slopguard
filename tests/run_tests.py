@@ -18,6 +18,7 @@ EXPECTED_RULES = {
     "placeholder-body", "hedging-comment", "dead-code", "bare-except",
     "swallowed-exception", "write-only-attr", "unused-private",
     "single-method-class", "as-any", "debug-artifact", "duplicate-code",
+    "long-comment",
 }
 
 EXPECTED_TEST_RULES = {
